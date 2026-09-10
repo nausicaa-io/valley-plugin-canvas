@@ -1,0 +1,16 @@
+{
+  "apiVersion": 5,
+  "id": "canvas",
+  "name": "Canvas",
+  "version": "2.0.0",
+  "description": "Obsidian-style infinite canvas for .canvas files: text, file/image and link cards, groups and arrow connections on a pan/zoom board.",
+  "author": [
+    "Yanik"
+  ],
+  "authorUrl": [
+    "https://github.com/yanik02"
+  ],
+  "isDesktopOnly": true,
+  "minAppVersion": "0.1.0",
+  "enabled": true
+}
