@@ -89,6 +89,32 @@ describe('CanvasEditor', () => {
     expect(root.classList.contains('canvas-pan-ready')).toBe(false)
   })
 
+  it('tracks pan keys and blur in the visible iframe and removes its listeners on unmount', async () => {
+    const frame = document.createElement('iframe')
+    document.body.append(frame)
+    const owner = frame.contentWindow!
+    const container = frame.contentDocument!.body.appendChild(frame.contentDocument!.createElement('div'))
+    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(oneCard) } })
+    initRuntime(mock.api)
+    const remove = vi.spyOn(owner, 'removeEventListener')
+    const mounted = render(<CanvasEditor relPath="Test.canvas" />, { container })
+    try {
+      await waitFor(() => expect(container.textContent).toContain('Hello canvas'))
+      const root = container.querySelector('.canvas-root')!
+      fireEvent.keyDown(root, { code: 'Space', key: ' ' })
+      expect(root).toHaveClass('canvas-pan-ready')
+      fireEvent.blur(window)
+      expect(root).toHaveClass('canvas-pan-ready')
+      fireEvent.blur(owner)
+      expect(root).not.toHaveClass('canvas-pan-ready')
+      fireEvent.keyDown(root, { code: 'Space', key: ' ' })
+      fireEvent.keyUp(owner, { code: 'Space', key: ' ' })
+      expect(root).not.toHaveClass('canvas-pan-ready')
+      mounted.unmount()
+      expect(remove.mock.calls.map(([type]) => type)).toEqual(expect.arrayContaining(['blur', 'keydown', 'keyup']))
+    } finally { mounted.unmount(); remove.mockRestore(); frame.remove() }
+  })
+
   it('uses local dimensions when panning inside a scaled parent Canvas', async () => {
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
     await screen.findByText('Hello canvas')
