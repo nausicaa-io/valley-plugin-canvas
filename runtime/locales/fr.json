@@ -87,5 +87,6 @@
   "manifest.name": "Canevas",
   "plugin.canvas.field.snapGrid": "Aligner sur la grille",
   "plugin.canvas.field.snapObjects": "Aligner sur les objets",
-  "plugin.canvas.newTab.create": "Nouveau canevas"
+  "plugin.canvas.newTab.create": "Nouveau canevas",
+  "canvas.error.preview": "L’aperçu du fichier est indisponible."
 }

@@ -1,4 +1,4 @@
-import { React, api } from './runtime'
+import { React, type CanvasOwner } from './runtime'
 import { assetUrlForRelPath, classifyFilePath, displayFileTitle } from '@valley/plugin-sdk/fileTypes'
 import {
   type CanvasNode,
@@ -22,13 +22,22 @@ const SIDES: EdgeSide[] = ['top', 'right', 'bottom', 'left']
  * that changed on disk keeps serving stale pixels. `useAssetUrl` is renderer-only
  * — a plugin busts its own cache, the way `todo/AttachmentCard` does.
  */
-function useAssetSrc(relPath: string): string {
+function useAssetSrc(relPath: string, owner: CanvasOwner): string {
   const [epoch, setEpoch] = React.useState(0)
-  React.useEffect(() => api.vault.onChanged(() => setEpoch((n) => n + 1)), [])
+  React.useEffect(() => {
+    if (!relPath || !owner.isActive()) return
+    const off = owner.api.vault.onChanged(event => {
+      if (owner.isActive() && (event.full || event.changes.some(change => change.relPath === relPath || change.kind.endsWith('Dir') && relPath.startsWith(`${change.relPath}/`)))) setEpoch(n => n + 1)
+    })
+    const offOwner = owner.onDispose(off)
+    return () => { offOwner(); off() }
+  }, [relPath, owner])
   return `${assetUrlForRelPath(relPath)}?v=${epoch}`
 }
 
 export interface NodeViewProps {
+  owner: CanvasOwner
+  previewEnabled: boolean
   node: CanvasNode
   sourcePath?: string
   /**
@@ -59,11 +68,13 @@ const BAND_SELECTED = 100000
 const BAND_EDITING = 200000
 
 /** Async body for a file node: image preview, markdown render, or a placeholder. */
-const FileBody = (props: { node: FileNode; sourcePath?: string }): ReturnType<typeof React.createElement> => {
-  const { node } = props
+const FileBody = (props: { node: FileNode; sourcePath?: string; owner: CanvasOwner }): ReturnType<typeof React.createElement> => {
+  const { node, owner } = props
+  const api = owner.api
   const kind = classifyFilePath(node.file)
   const [markdown, setMarkdown] = React.useState<string | null>(null)
-  const imgSrc = useAssetSrc(node.file)
+  const [error, setError] = React.useState('')
+  const imgSrc = useAssetSrc(node.file, owner)
 
   React.useEffect(() => {
     if (kind !== 'text') {
@@ -71,15 +82,19 @@ const FileBody = (props: { node: FileNode; sourcePath?: string }): ReturnType<ty
       return
     }
     let cancelled = false
-    void api.vault.readFile(node.file).then((text) => {
+    setError('')
+    void owner.run(() => api.vault.readFileBaseline(node.file)).then((file) => {
+      if (!file?.baseline) throw new Error(uiText('canvas.error.preview'))
       // A `subpath` narrows the embed to one heading or block — without this the
       // card renders the whole note and the anchor is silently ignored.
-      if (!cancelled) setMarkdown(sliceSubpath(text, node.subpath))
-    })
+      if (!cancelled && owner.isActive()) setMarkdown(sliceSubpath(file.content, node.subpath))
+    }).catch(reason => { if (!cancelled && owner.isActive()) setError(reason instanceof Error ? reason.message : uiText('canvas.error.preview')) })
     return () => {
       cancelled = true
     }
-  }, [node.file, node.subpath, kind, imgSrc])
+  }, [node.file, node.subpath, kind, imgSrc, owner, api])
+
+  if (error) return <p role="alert">{error}</p>
 
   if (kind === 'base' || /\.canvas$/i.test(node.file)) {
     const Preview = api.ui.FilePreview
@@ -103,9 +118,9 @@ const FileBody = (props: { node: FileNode; sourcePath?: string }): ReturnType<ty
 }
 
 /** The group's optional background image, painted under its colour tint. */
-const GroupBackground = (props: { node: GroupNode }): ReturnType<typeof React.createElement> | null => {
+const GroupBackground = (props: { node: GroupNode; owner: CanvasOwner }): ReturnType<typeof React.createElement> | null => {
   const { node } = props
-  const src = useAssetSrc(node.background ?? '')
+  const src = useAssetSrc(node.background ?? '', props.owner)
   if (!node.background) return null
   const style: React.CSSProperties = { backgroundImage: `url("${src}")` }
   return <div className={`canvas-group-bg ${node.backgroundStyle ?? 'cover'}`} style={style} />
@@ -152,6 +167,29 @@ const InlineInput = (props: {
 
 export const NodeView = (props: NodeViewProps): ReturnType<typeof React.createElement> => {
   const { node, index, selected, singleSelected, editing, dragging, readOnly } = props
+  const root = React.useRef<HTMLDivElement>(null)
+  const [visible, setVisible] = React.useState(typeof IntersectionObserver === 'undefined')
+  React.useEffect(() => {
+    const element = root.current
+    if (!element) return
+    const document = element.ownerDocument
+    const Observer = document.defaultView?.IntersectionObserver
+    let intersecting = !Observer
+    let active = true
+    const update = (): void => { if (active) setVisible(props.owner.isActive() && intersecting && document.visibilityState !== 'hidden') }
+    const observer = Observer ? new Observer(records => {
+      const record = records.find(record => record.target === element)
+      if (record) intersecting = record.isIntersecting
+      update()
+    }, { root: element.closest('.canvas-root'), rootMargin: '120px' }) : null
+    observer?.observe(element)
+    document.addEventListener('visibilitychange', update)
+    const cleanup = (): void => { active = false; observer?.disconnect(); document.removeEventListener('visibilitychange', update) }
+    const offOwner = props.owner.onDispose(() => { update(); cleanup() })
+    update()
+    return () => { cleanup(); offOwner() }
+  }, [props.owner])
+  const showBody = editing || node.type === 'file' && !node.file || node.type === 'link' && !node.url || props.previewEnabled && visible
   const accent = resolveColor(node.color)
   const isGroup = node.type === 'group'
   const style: React.CSSProperties = {
@@ -180,6 +218,7 @@ export const NodeView = (props: NodeViewProps): ReturnType<typeof React.createEl
 
   return (
     <div
+      ref={root}
       className={className}
       style={style}
       data-node-id={node.id}
@@ -192,7 +231,7 @@ export const NodeView = (props: NodeViewProps): ReturnType<typeof React.createEl
       {/* The title rides above the card, so it renders outside the container. */}
       {renderLabel(node, editing, props)}
 
-      <div className="canvas-node-container">{renderBody(node, editing, props)}</div>
+      <div className="canvas-node-container">{showBody ? renderBody(node, editing, props) : null}</div>
 
       {/* Connection ports (CSS shows them on hover / when selected). */}
       {!editing &&
@@ -237,7 +276,7 @@ function renderLabel(
         className="canvas-node-label"
         title={node.subpath ? `${node.file}${node.subpath}` : node.file}
         onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => api.workspace.openFile(node.file, undefined, { newTab: api.ui.hasModKey(e) })}
+        onClick={(e) => { if (props.owner.isActive()) void props.owner.api.workspace.openFile(node.file, undefined, { newTab: props.owner.api.ui.hasModKey(e) }) }}
       >
         <FileCardIcon />
         <span className="canvas-node-title">
@@ -267,17 +306,18 @@ function renderLabel(
 function renderBody(node: CanvasNode, editing: boolean, props: NodeViewProps): ReturnType<typeof React.createElement> {
   switch (node.type) {
     case 'text':
-      return <TextBody node={node} editing={editing} onCommit={props.onCommit} onCancel={props.onCancelEdit} />
+      return <TextBody owner={props.owner} node={node} editing={editing} onCommit={props.onCommit} onCancel={props.onCancelEdit} />
     case 'group':
-      return <GroupBackground node={node} />
+      return <GroupBackground owner={props.owner} node={node} />
     case 'link':
-      return <LinkBody node={node} editing={editing} interactive={props.singleSelected} onCommit={props.onCommit} onCancel={props.onCancelEdit} />
+      return <LinkBody owner={props.owner} node={node} editing={editing} interactive={props.singleSelected} onCommit={props.onCommit} onCancel={props.onCancelEdit} />
     case 'file':
-      return <FileCard sourcePath={props.sourcePath} node={node} onCommit={props.onCommit} onCancel={props.onCancelEdit} />
+      return <FileCard owner={props.owner} sourcePath={props.sourcePath} node={node} onCommit={props.onCommit} onCancel={props.onCancelEdit} />
   }
 }
 
 const TextBody = (props: {
+  owner: CanvasOwner
   node: TextNode
   editing: boolean
   onCommit: (node: CanvasNode, patch: Partial<CanvasNode>) => void
@@ -287,11 +327,12 @@ const TextBody = (props: {
   const [draft, setDraft] = React.useState(node.text)
   const [html, setHtml] = React.useState('')
   React.useEffect(() => {
+    if (editing) return
     let active = true
     setHtml('')
-    void api.markdown.render(node.text || '*Empty card*').then((value) => { if (active) setHtml(value) }).catch(() => { if (active) setHtml('') })
+    void props.owner.run(() => props.owner.api.markdown.render(node.text || '*Empty card*')).then((value) => { if (active && props.owner.isActive()) setHtml(value) }).catch(() => { if (active && props.owner.isActive()) setHtml('') })
     return () => { active = false }
-  }, [node.text])
+  }, [node.text, props.owner, editing])
   React.useEffect(() => {
     if (editing) setDraft(node.text)
   }, [editing, node.text])
@@ -344,21 +385,23 @@ const GroupLabel = (props: {
   return <div className="canvas-group-label">{node.label || uiText('auto.171a0606f7c7')}</div>
 }
 
-const WebPreview = ({ url, interactive }: { url: string; interactive: boolean }): ReturnType<typeof React.createElement> => {
+const WebPreview = ({ url, interactive, owner }: { url: string; interactive: boolean; owner: CanvasOwner }): ReturnType<typeof React.createElement> => {
   const host = React.useRef<HTMLDivElement>(null)
   React.useEffect(() => {
-    if (!host.current || !/^https?:\/\//i.test(url)) return
+    if (!host.current || !owner.isActive() || !/^https?:\/\//i.test(url)) return
     const guest = document.createElement('webview')
     guest.setAttribute('partition', 'web-incognito')
     guest.setAttribute('src', url)
     guest.setAttribute('aria-label', url)
     host.current.append(guest)
-    return () => guest.remove()
-  }, [url])
+    const offOwner = owner.onDispose(() => guest.remove())
+    return () => { offOwner(); guest.remove() }
+  }, [url, owner])
   return <div ref={host} className="canvas-web-preview" style={{ pointerEvents: interactive ? 'auto' : 'none' }} />
 }
 
 const LinkBody = (props: {
+  owner: CanvasOwner
   node: LinkNode
   editing: boolean
   interactive: boolean
@@ -378,7 +421,7 @@ const LinkBody = (props: {
   }
   return (
     <div className="canvas-node-body canvas-link-body">
-      <WebPreview url={node.url} interactive={props.interactive} />
+      <WebPreview owner={props.owner} url={node.url} interactive={props.interactive} />
       <a
         className="canvas-link-anchor"
         href={/^https?:\/\//i.test(node.url) ? node.url : undefined}
@@ -393,6 +436,7 @@ const LinkBody = (props: {
 }
 
 const FileCard = (props: {
+  owner: CanvasOwner
   sourcePath?: string
   node: FileNode
   onCommit: (node: CanvasNode, patch: Partial<CanvasNode>) => void
@@ -404,11 +448,11 @@ const FileCard = (props: {
       <InlineInput
         placeholder={uiText('auto.a11d06d5c5ea')}
         initial=""
-        resolve={(value) => api.workspace.resolveWikilink(value)}
+        resolve={(value) => props.owner.isActive() ? props.owner.api.workspace.resolveWikilink(value) : null}
         onCommit={(file) => props.onCommit(node, { file } as Partial<FileNode>)}
         onCancel={props.onCancel}
       />
     )
   }
-  return <FileBody node={node} sourcePath={props.sourcePath} />
+  return <FileBody owner={props.owner} node={node} sourcePath={props.sourcePath} />
 }

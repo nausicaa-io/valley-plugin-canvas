@@ -87,5 +87,6 @@
   "manifest.name": "画布",
   "plugin.canvas.field.snapGrid": "对齐网格",
   "plugin.canvas.field.snapObjects": "对齐对象",
-  "plugin.canvas.newTab.create": "新建画布"
+  "plugin.canvas.newTab.create": "新建画布",
+  "canvas.error.preview": "文件预览不可用。"
 }

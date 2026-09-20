@@ -87,5 +87,6 @@
   "manifest.name": "Zeichenfläche",
   "plugin.canvas.field.snapGrid": "Am Raster ausrichten",
   "plugin.canvas.field.snapObjects": "An Objekten ausrichten",
-  "plugin.canvas.newTab.create": "Neue Leinwand"
+  "plugin.canvas.newTab.create": "Neue Leinwand",
+  "canvas.error.preview": "Die Dateivorschau ist nicht verfügbar."
 }

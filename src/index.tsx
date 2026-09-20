@@ -20,21 +20,21 @@ import { canvasNewTabEntry } from './newTabEntry'
 import CanvasEditor from './CanvasEditor'
 import { initLocalization } from './localization'
 
-export function register(api: ValleyPluginApi): () => void {
+export function register(api: ValleyPluginApi): () => Promise<void> {
   initLocalization(api)
-  initRuntime(api)
+  const owner = initRuntime(api)
   const disposeStyles = injectStyles()
 
   // The host mounts this file view with a `relPath` prop (see TabView); cast
   // through the registry's propless `ComponentType` slot.
   api.registerView('canvas.editor', CanvasEditor as unknown as Parameters<typeof api.registerView>[1])
-  const offCommands = registerCanvasCommands(api)
-  const offSurfaces = registerCanvasSurfaces(api)
+  const offCommands = registerCanvasCommands(api, owner)
+  const offSurfaces = registerCanvasSurfaces(api, owner)
   // The owner-scoped bus applies the same guard policy as the palette, CLI and
   // assistant without embedding this package's id in its own implementation.
   const offNewTab = api.interop.extensions.provide(
     NEW_TAB_ENTRY_V1,
-    canvasNewTabEntry(() => void api.commands.executeOwn('create'))
+    canvasNewTabEntry(() => { if (owner.isActive()) void api.commands.executeOwn('create') })
   )
 
   return () => {
@@ -42,6 +42,7 @@ export function register(api: ValleyPluginApi): () => void {
     offCommands()
     offSurfaces()
     disposeStyles()
+    return owner.dispose()
   }
 }
 

@@ -82,7 +82,7 @@ export interface CanvasData {
  * colors are intentionally not defined so that applications can tailor the
  * presets to their specific brand colors or color scheme" — so `"1".."6"` stays
  * the on-disk form (that is the Obsidian interop contract) while the rendered
- * colour comes from `src/shared/palette.ts` and follows light/reading/dark plus
+ * colour comes from `src/shared/palette.ts` and follows light/dark plus
  * any `.valley/design/*.css` override. Valley's palette names the last one
  * `violet`; the spec calls it purple.
  */

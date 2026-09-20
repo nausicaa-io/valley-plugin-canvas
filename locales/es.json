@@ -87,5 +87,6 @@
   "manifest.name": "Lienzo",
   "plugin.canvas.field.snapGrid": "Ajustar a la cuadrícula",
   "plugin.canvas.field.snapObjects": "Ajustar a los objetos",
-  "plugin.canvas.newTab.create": "Nuevo lienzo"
+  "plugin.canvas.newTab.create": "Nuevo lienzo",
+  "canvas.error.preview": "La vista previa del archivo no está disponible."
 }

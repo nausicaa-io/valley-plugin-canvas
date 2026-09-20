@@ -60,6 +60,148 @@ describe('CanvasEditor', () => {
     expect(await screen.findByText('Hello canvas')).toBeTruthy()
   })
 
+  it('keeps compatibility double-clicks on the card until a drag actually starts', async () => {
+    const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
+    await screen.findByText('Hello canvas')
+    const root = container.querySelector('.canvas-root') as HTMLElement
+    const card = container.querySelector('[data-node-id="a"]') as HTMLElement
+    let compatibilityTarget = card
+    root.setPointerCapture = vi.fn(() => { compatibilityTarget = root })
+    for (let detail = 1; detail <= 2; detail++) {
+      fireEvent.pointerDown(card, { button: 0, pointerId: 1, clientX: 100, clientY: 60 })
+      fireEvent.pointerMove(compatibilityTarget, { pointerId: 1, buttons: 1, clientX: 103, clientY: 60 })
+      fireEvent.pointerUp(compatibilityTarget, { pointerId: 1, clientX: 103, clientY: 60 })
+      fireEvent.click(compatibilityTarget, { detail })
+    }
+    fireEvent.doubleClick(compatibilityTarget)
+    expect(root.setPointerCapture).not.toHaveBeenCalled()
+    const input = await screen.findByDisplayValue('Hello canvas')
+    fireEvent.change(input, { target: { value: 'Edited by double-click' } })
+    fireEvent.blur(input)
+    await act(async () => { await mock.runBeforeUnload() })
+    expect(parseCanvas(await mock.api.vault.readFile('Test.canvas')).nodes[0]).toMatchObject({ id: 'a', text: 'Edited by double-click', x: 0, y: 0 })
+  })
+
+  it.each([false, true])('cancels a pending card drag released outside the canvas before later hover (duplicate=%s)', async (altKey) => {
+    const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
+    await screen.findByText('Hello canvas')
+    const root = container.querySelector('.canvas-root') as HTMLElement
+    const card = container.querySelector('[data-node-id="a"]') as HTMLElement
+    root.setPointerCapture = vi.fn()
+    fireEvent.pointerDown(card, { button: 0, pointerId: 6, clientX: 10, clientY: 10, altKey })
+    fireEvent.pointerUp(document.body, { pointerId: 6, clientX: 12, clientY: 10 })
+    fireEvent.pointerMove(card, { pointerId: 6, buttons: 0, clientX: 90, clientY: 90 })
+    fireEvent.pointerMove(card, { pointerId: 6, buttons: 0, clientX: 110, clientY: 110 })
+    expect(root.setPointerCapture).not.toHaveBeenCalled()
+    expect(canvasSession('Test.canvas')!.get().data).toEqual(oneCard)
+    expect(container.querySelector('.canvas-node.dragging')).toBeNull()
+    await act(async () => { await mock.runBeforeUnload() })
+    expect(mock.api.vault.writeFileGuarded).not.toHaveBeenCalled()
+    expect(parseCanvas(await mock.api.vault.readFile('Test.canvas'))).toEqual(oneCard)
+  })
+
+  it.each([false, true])('captures and saves a real card drag after the movement threshold (duplicate=%s)', async (altKey) => {
+    const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
+    await screen.findByText('Hello canvas')
+    const root = container.querySelector('.canvas-root') as HTMLElement
+    const card = container.querySelector('[data-node-id="a"]') as HTMLElement
+    root.setPointerCapture = vi.fn()
+    fireEvent.pointerDown(card, { button: 0, pointerId: 8, clientX: 10, clientY: 10, altKey })
+    expect(root.setPointerCapture).not.toHaveBeenCalled()
+    const selected = canvasSession('Test.canvas')!.get().nodeIds
+    expect(selected).toHaveLength(1)
+    if (altKey) expect(selected[0]).not.toBe('a')
+    fireEvent.pointerMove(card, { pointerId: 8, buttons: 1, clientX: 14, clientY: 10 })
+    expect(root.setPointerCapture).toHaveBeenCalledTimes(1)
+    expect(root.setPointerCapture).toHaveBeenCalledWith(8)
+    fireEvent.pointerMove(root, { pointerId: 8, buttons: 1, clientX: 80, clientY: 50 })
+    expect(root.setPointerCapture).toHaveBeenCalledTimes(1)
+    expect(container.querySelector(`[data-node-id="${selected[0]}"]`)).toHaveClass('dragging')
+    fireEvent.pointerUp(root, { pointerId: 8, clientX: 80, clientY: 50 })
+    await act(async () => { await mock.runBeforeUnload() })
+    const saved = parseCanvas(await mock.api.vault.readFile('Test.canvas'))
+    expect(saved.nodes).toHaveLength(altKey ? 2 : 1)
+    expect(saved.nodes.find(node => node.id === selected[0])).toMatchObject({ x: 70, y: 40 })
+    if (altKey) expect(saved.nodes.find(node => node.id === 'a')).toEqual(oneCard.nodes[0])
+    expect(container.querySelector('.canvas-node.dragging')).toBeNull()
+  })
+
+  it('rereads a file changed while its initial canvas load is pending', async () => {
+    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(oneCard) } })
+    const original = await mock.api.vault.readFileBaseline('Test.canvas')
+    let complete!: (file: typeof original) => void
+    const read = vi.spyOn(mock.api.vault, 'readFileBaseline')
+    read.mockImplementationOnce(() => new Promise((resolve) => { complete = resolve }))
+    const newest = { ...oneCard, nodes: [{ ...oneCard.nodes[0], text: 'Newest initial canvas' }] }
+    read.mockResolvedValueOnce({ ...original!, content: serializeCanvas(newest) })
+    initRuntime(mock.api)
+    render(<CanvasEditor relPath="Test.canvas" />)
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1))
+    act(() => mock.emitVaultChanged({ changes: [{ relPath: 'Test.canvas', kind: 'change' }] }))
+    await act(async () => { complete(original) })
+    await screen.findByText('Newest initial canvas')
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(canvasSession('Test.canvas')?.get().data).toEqual(newest)
+    expect(mock.api.vault.writeFileGuarded).not.toHaveBeenCalled()
+  })
+
+  it('scopes reloads to its file and merges an external change burst without publishing the stale canvas', async () => {
+    mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
+    await screen.findByText('Hello canvas')
+    const original = await mock.api.vault.readFileBaseline('Test.canvas')
+    const read = vi.spyOn(mock.api.vault, 'readFileBaseline')
+    act(() => mock.emitVaultChanged({ changes: [{ relPath: 'Other.canvas', kind: 'change' }] }))
+    expect(read).not.toHaveBeenCalled()
+    let complete!: (file: typeof original) => void
+    read.mockImplementationOnce(() => new Promise((resolve) => { complete = resolve }))
+    const newest = { ...oneCard, nodes: [{ ...oneCard.nodes[0], text: 'Newest canvas' }] }
+    read.mockResolvedValueOnce({ ...original!, content: serializeCanvas(newest) })
+    act(() => {
+      for (let index = 0; index < 20; index++) mock.emitVaultChanged({ changes: [{ relPath: 'Test.canvas', kind: 'change' }] })
+    })
+    expect(read).toHaveBeenCalledTimes(1)
+    await act(async () => { complete({ ...original!, content: serializeCanvas({ ...oneCard, nodes: [] }) }) })
+    await screen.findByText('Newest canvas')
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(canvasSession('Test.canvas')?.get().data).toEqual(newest)
+    expect(mock.api.vault.writeFileGuarded).not.toHaveBeenCalled()
+  })
+
+  it('discards a pending external reload when its editor is unmounted', async () => {
+    const mounted = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
+    await screen.findByText('Hello canvas')
+    const original = await mock.api.vault.readFileBaseline('Test.canvas')
+    let complete!: (file: typeof original) => void
+    const read = vi.spyOn(mock.api.vault, 'readFileBaseline')
+    read.mockImplementationOnce(() => new Promise((resolve) => { complete = resolve }))
+    act(() => mock.emitVaultChanged({ full: true }))
+    mounted.unmount()
+    const runtime = vi.spyOn(mock.api.runtime, 'getOrCreate').mockImplementation(() => { throw new Error('Session revoked') })
+    try {
+      await act(async () => { complete({ ...original!, content: serializeCanvas({ nodes: [], edges: [] }) }) })
+      expect(runtime).not.toHaveBeenCalled()
+      expect(read).toHaveBeenCalledTimes(1)
+    } finally { runtime.mockRestore() }
+  })
+
+  it('keeps a card edited during a pending external reload and its original guarded baseline', async () => {
+    mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
+    const body = await screen.findByText('Hello canvas')
+    const original = await mock.api.vault.readFileBaseline('Test.canvas')
+    let complete!: (file: typeof original) => void
+    vi.spyOn(mock.api.vault, 'readFileBaseline').mockImplementationOnce(() => new Promise((resolve) => { complete = resolve }))
+    act(() => mock.emitVaultChanged({ full: true }))
+    fireEvent.doubleClick(body)
+    const textarea = await screen.findByDisplayValue('Hello canvas')
+    fireEvent.change(textarea, { target: { value: 'Retained edit' } })
+    fireEvent.blur(textarea)
+    await act(async () => { complete({ ...original!, content: serializeCanvas({ nodes: [], edges: [] }) }) })
+    expect(canvasSession('Test.canvas')?.get().data.nodes[0]).toMatchObject({ text: 'Retained edit' })
+    expect(canvasDraft('Test.canvas')?.baseline).toEqual(original?.baseline)
+    await act(async () => { await mock.runBeforeUnload() })
+    expect(mock.api.vault.writeFileGuarded).toHaveBeenCalledWith('Test.canvas', expect.stringContaining('Retained edit'), original?.baseline)
+  })
+
   it('offers eight border resize targets before selection and cancels a gesture without writing', async () => {
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
     await screen.findByText('Hello canvas')
@@ -184,6 +326,39 @@ describe('CanvasEditor', () => {
     expect(canvasSession('Test.canvas')?.get().data.edges).toHaveLength(2)
     await act(async () => { expect(await mock.undoActions.at(-1)!.undo()).toMatchObject({ ok: true }) })
     expect(canvasSession('Test.canvas')?.get().data.edges).toHaveLength(3)
+  })
+
+  it('resolves a connection target in its own document when the editor is mounted in a frame', async () => {
+    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas({ nodes: wired.nodes, edges: [] }) } })
+    initRuntime(mock.api)
+    const frame = document.createElement('iframe')
+    document.body.append(frame)
+    const frameDocument = frame.contentDocument!
+    Object.defineProperty(frame.contentWindow!, 'PointerEvent', { configurable: true, value: window.PointerEvent })
+    const container = frameDocument.createElement('div')
+    frameDocument.body.append(container)
+    const mounted = render(<CanvasEditor relPath="Test.canvas" />, { container, baseElement: frameDocument.body })
+    const parentDescriptor = Object.getOwnPropertyDescriptor(document, 'elementFromPoint')
+    const parentHit = vi.fn(() => null)
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: parentHit })
+    try {
+      await mounted.findByText('Node A')
+      const target = container.querySelector('[data-node-id="b"]')!
+      const frameHit = vi.fn(() => target)
+      Object.defineProperty(frameDocument, 'elementFromPoint', { configurable: true, value: frameHit })
+      fireEvent.pointerDown(container.querySelector('[data-node-id="a"] .canvas-port.right')!, { button: 0, pointerId: 9 })
+      fireEvent.pointerUp(container.querySelector('.canvas-root')!, { pointerId: 9, clientX: 420, clientY: 20 })
+      expect(canvasSession('Test.canvas')?.get().data.nodes).toHaveLength(2)
+      expect(canvasSession('Test.canvas')?.get().data.edges).toEqual([expect.objectContaining({ fromNode: 'a', toNode: 'b' })])
+      expect(frameHit).toHaveBeenCalledWith(420, 20)
+      expect(parentHit).not.toHaveBeenCalled()
+      await act(async () => { await mock.runBeforeUnload() })
+    } finally {
+      mounted.unmount()
+      frame.remove()
+      if (parentDescriptor) Object.defineProperty(document, 'elementFromPoint', parentDescriptor)
+      else Reflect.deleteProperty(document, 'elementFromPoint')
+    }
   })
 
   it('creates a card and connection together when releasing a port onto empty space', async () => {

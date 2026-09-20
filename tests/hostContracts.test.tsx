@@ -56,7 +56,7 @@ describe('package host contracts', () => {
     } finally { dispose() }
   })
   it('owns and disposes its stylesheet in every theme', () => {
-    for (const theme of ['dark', 'light', 'reading']) {
+    for (const theme of ['dark', 'light']) {
       document.documentElement.dataset.theme = theme
       for (let pass = 0; pass < 2; pass++) {
         const dispose = injectStyles()
@@ -77,7 +77,7 @@ function styleSources(root: string): string[] {
 }
 
 it('keeps package styles tokenized, scalable, and consistent with SDK drop markers', () => {
-  const hexes = new Set(DEFAULT_PALETTE.flatMap((color) => [color.light, color.reading, color.dark]))
+  const hexes = new Set(DEFAULT_PALETTE.flatMap((color) => [color.light, color.dark]))
   hexes.delete('#3b82f6')
   const fixedGlyph = new RegExp('(?!)')
   const retired = /var\(--(?:pink-color|danger-color|red-color|red|monospace-font|font-monospace|font-mono|code-font|ui-font|tint-blue-(?:bg|text))\b|--(?:pink-color|danger-color|red-color|red|monospace-font|font-monospace|font-mono|code-font|ui-font|tint-blue-(?:bg|text))\s*:/

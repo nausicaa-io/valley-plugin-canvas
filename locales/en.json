@@ -87,5 +87,6 @@
   "manifest.name": "Canvas",
   "plugin.canvas.field.snapGrid": "Snap to grid",
   "plugin.canvas.field.snapObjects": "Snap to objects",
-  "plugin.canvas.newTab.create": "New canvas"
+  "plugin.canvas.newTab.create": "New canvas",
+  "canvas.error.preview": "The file preview is unavailable."
 }

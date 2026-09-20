@@ -3,6 +3,7 @@ import type { FileBaseline } from '@valley/plugin-sdk/types'
 import { EMPTY_CANVAS, addNode, addEdge, createTextNode, createFileNode, createLinkNode, createGroupNode, duplicateNodes, removeNodes, removeEdges, reorderNodes, updateNode, parseCanvas, serializeCanvas, type CanvasData, type CanvasNode, type CanvasEdge } from './canvasModel'
 import { isAllowedExternalUrl, normalizeRelPathOpt } from '@valley/plugin-sdk/paths'
 import { canvasDraft, canvasSession } from './session'
+import { captureCanvasOwner, type CanvasOwner } from './runtime'
 
 /** Parent folder of the active file (or vault root when nothing is open). */
 function activeFolder(api: ValleyPluginApi): string {
@@ -15,14 +16,18 @@ function activeFolder(api: ValleyPluginApi): string {
 /** Atomically create the first free `Untitled[.n].canvas` in `folder`. */
 async function createCanvasFile(
   api: ValleyPluginApi,
-  folder: string
+  folder: string,
+  owner: CanvasOwner,
+  assertActive: () => void
 ): Promise<{ relPath: string; baseline: FileBaseline }> {
   const prefix = folder ? `${folder}/` : ''
   for (let n = 0; n < 1000; n++) {
     const name = n === 0 ? 'Untitled.canvas' : `Untitled ${n}.canvas`
     const relPath = `${prefix}${name}`
-    const written = await api.vault.writeFileGuarded(relPath, EMPTY_CANVAS, null)
+    assertActive()
+    const written = await owner.run(() => { assertActive(); return api.vault.writeFileGuarded(relPath, EMPTY_CANVAS, null) })
     if (written.ok) return { relPath, baseline: written.baseline }
+    assertActive()
     if (written.reason === 'error') throw new Error(`Could not create ${relPath}`)
   }
   throw new Error(`Could not find a free canvas name in ${folder || 'the vault root'}`)
@@ -32,26 +37,37 @@ async function createCanvasFile(
  * `canvas:create` — write an empty JSONCanvas next to the active file and open
  * it. Undo removes only the exact baseline created here; an edited file wins.
  */
-export function registerCanvasCommands(api: ValleyPluginApi): () => void {
+export function registerCanvasCommands(api: ValleyPluginApi, owner = captureCanvasOwner(api)): () => void {
+  let registered = true
+  const assertActive = (): void => { owner.assertActive(); if (!registered) throw new Error('The canvas commands are no longer registered.') }
+  const guardedVault = {
+    ...api.vault,
+    restoreTrashed: (...args: Parameters<typeof api.vault.restoreTrashed>) => owner.run(() => { assertActive(); return api.vault.restoreTrashed(...args) }),
+    readFileBaseline: (path: string) => owner.run(() => { assertActive(); return api.vault.readFileBaseline(path) }),
+    trashFileGuarded: (...args: Parameters<typeof api.vault.trashFileGuarded>) => owner.run(() => { assertActive(); return api.vault.trashFileGuarded(...args) }),
+    writeFileGuarded: (...args: Parameters<typeof api.vault.writeFileGuarded>) => owner.run(() => { assertActive(); return api.vault.writeFileGuarded(...args) })
+  }
+
   const offCreate = api.commands.register<{ folder?: string }, { relPath: string }, 'write'>({
     id: 'create',
     label: 'Canvas: Create new canvas', labelKey: 'auto.7b18787efddd',
     sideEffect: 'write',
-    revision: ({ folder }) => ({ folder: folder ?? activeFolder(api) }),
-    preview: ({ folder }) => ({ action: 'create-canvas', folder: folder ?? activeFolder(api) }),
+    revision: ({ folder }) => { assertActive(); return { folder: folder ?? activeFolder(api) } },
+    preview: ({ folder }) => { assertActive(); return { action: 'create-canvas', folder: folder ?? activeFolder(api) } },
     input: { schema: { type: 'object', properties: { folder: { type: 'string' } }, additionalProperties: false }, parse: (raw) => { const folder = (raw as { folder?: unknown } | undefined)?.folder; if (folder !== undefined && (typeof folder !== 'string' || (folder && normalizeRelPathOpt(folder) !== folder))) throw new Error('Expected a vault folder.'); return { folder: folder as string | undefined } } },
     run: async ({ folder }) => {
-      const { relPath, baseline } = await createCanvasFile(api, folder ?? activeFolder(api))
-      await api.workspace.openFile(relPath)
+      assertActive()
+      const { relPath, baseline } = await createCanvasFile(api, folder ?? activeFolder(api), owner, assertActive)
+      if (registered && owner.isActive()) await owner.run(() => { assertActive(); return api.workspace.openFile(relPath) })
       return {
         value: { relPath },
-        revert: guardedCreatedFileRevert(api.vault, relPath, EMPTY_CANVAS, baseline, 'Create canvas')
+        revert: guardedCreatedFileRevert(guardedVault, relPath, EMPTY_CANVAS, baseline, 'Create canvas')
       }
     }
   })
-  const offGet = api.commands.register({ id: 'get', label: 'Canvas: Inspect canvas', labelKey: 'canvas.command.get', paletteSafe: false, sideEffect: 'read', input: { schema: objectSchema({ path: stringSchema }, ['path']), parse: (raw) => ({ path: requiredString(record(raw).path) }) }, run: async ({ path }) => { const target = await readCanvasTarget(api, path); return { path, data: target.data, revision: target.revision } } })
-  const offEdit = api.commands.register({ id: 'edit', label: 'Canvas: Edit canvas', labelKey: 'canvas.command.edit', paletteSafe: false, sideEffect: 'write', input: { schema: objectSchema({ path: stringSchema, operation: canvasOperationSchema, expectedRevision: { type: 'string' } }, ['path', 'operation']), parse: (raw) => { const input = record(raw); if (input.expectedRevision !== undefined && typeof input.expectedRevision !== 'string') throw new Error('Expected a canvas revision.'); return { path: requiredString(input.path), operation: record(input.operation), expectedRevision: input.expectedRevision as string | undefined } } }, revision: async ({ path }) => (await readCanvasTarget(api, path)).revision, preview: ({ path, operation }) => ({ path, operation }), run: ({ path, operation, expectedRevision }) => editCanvasTarget(api, path, operation, expectedRevision) })
-  return () => { offCreate(); offGet(); offEdit() }
+  const offGet = api.commands.register({ id: 'get', label: 'Canvas: Inspect canvas', labelKey: 'canvas.command.get', paletteSafe: false, sideEffect: 'read', input: { schema: objectSchema({ path: stringSchema }, ['path']), parse: (raw) => ({ path: requiredString(record(raw).path) }) }, run: async ({ path }) => { const target = await readCanvasTarget(api, path, owner, assertActive); return { path, data: target.data, revision: target.revision } } })
+  const offEdit = api.commands.register({ id: 'edit', label: 'Canvas: Edit canvas', labelKey: 'canvas.command.edit', paletteSafe: false, sideEffect: 'write', input: { schema: objectSchema({ path: stringSchema, operation: canvasOperationSchema, expectedRevision: { type: 'string' } }, ['path', 'operation']), parse: (raw) => { const input = record(raw); if (input.expectedRevision !== undefined && typeof input.expectedRevision !== 'string') throw new Error('Expected a canvas revision.'); return { path: requiredString(input.path), operation: record(input.operation), expectedRevision: input.expectedRevision as string | undefined } } }, revision: async ({ path }) => (await readCanvasTarget(api, path, owner, assertActive)).revision, preview: ({ path, operation }) => ({ path, operation }), run: ({ path, operation, expectedRevision }) => editCanvasTarget(api, path, operation, expectedRevision, owner, assertActive) })
+  return () => { registered = false; offCreate(); offGet(); offEdit() }
 
 }
 
@@ -137,31 +153,52 @@ export function applyCanvasOperation(data: CanvasData, raw: unknown): CanvasData
   }
 }
 
-export async function readCanvasTarget(api: ValleyPluginApi, path: string) {
+export async function readCanvasTarget(api: ValleyPluginApi, path: string, owner = captureCanvasOwner(api), assertActive = owner.assertActive) {
+  assertActive()
   if (!path.endsWith('.canvas') || normalizeRelPathOpt(path) !== path) throw new Error('Expected a vault-relative canvas path.')
-  const session = canvasSession(path)
+  const session = canvasSession(path, owner)
   if (session) { const snapshot = session.get(); if (!snapshot.ready) throw new Error('The canvas is still loading.'); return { data: snapshot.data, revision: snapshot.revision, baseline: null, session } }
-  if (canvasDraft(path)) throw new Error('The canvas has an unsaved draft. Reopen it and resolve the save error before editing.')
-  const file = await api.vault.readFileBaseline(path)
+  if (canvasDraft(path, owner)) throw new Error('The canvas has an unsaved draft. Reopen it and resolve the save error before editing.')
+  const recovery = await owner.run(() => { assertActive(); return api.vault.drafts.read(path, 'editor') })
+  assertActive()
+  if (recovery) throw new Error('The canvas has an unsaved draft. Reopen it and resolve the save error before editing.')
+  const file = await owner.run(() => { assertActive(); return api.vault.readFileBaseline(path) })
+  assertActive()
+  if (canvasSession(path, owner) || canvasDraft(path, owner)) throw new Error('The canvas changed. Inspect its active draft before editing.')
   if (!file) throw new Error('The canvas file no longer exists.')
   const parsed = JSON.parse(file.content)
   if (!parsed || !Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) throw new Error('The canvas file is invalid.')
   const data = parseCanvas(file.content)
   return { data, revision: serializeCanvas(data), baseline: file.baseline, session: undefined }
 }
-
-export async function editCanvasTarget(api: ValleyPluginApi, path: string, operation: unknown, expectedRevision?: string) {
-  const previous = await readCanvasTarget(api, path)
-  if (expectedRevision !== undefined && expectedRevision !== previous.revision) throw new Error('The canvas changed. Inspect it again before editing.')
-  const next = applyCanvasOperation(previous.data, operation)
-  const nextRevision = serializeCanvas(next)
-  if (previous.session) await previous.session.commit(next, previous.revision)
-  else { const result = await api.vault.writeFileGuarded(path, nextRevision, previous.baseline); if (!result.ok) throw new Error('The canvas changed or could not be saved. Your request was not applied.'); }
-  const restore = async (data: CanvasData, revision: string): Promise<void> => {
-    const current = await readCanvasTarget(api, path)
-    if (current.revision !== revision) throw new Error('The canvas changed after this edit. Undo would overwrite newer work.')
-    if (current.session) await current.session.commit(data, revision)
-    else if (!(await api.vault.writeFileGuarded(path, serializeCanvas(data), current.baseline)).ok) throw new Error('Could not restore the canvas.')
+async function commitTarget(owner: CanvasOwner, path: string, data: CanvasData, previous: Awaited<ReturnType<typeof readCanvasTarget>>, assertActive: () => void): Promise<void> {
+  assertActive()
+  if (canvasSession(path, owner) !== previous.session) throw new Error('The canvas changed. Inspect its active draft before editing.')
+  if (previous.session) await owner.run(() => { assertActive(); return previous.session!.commit(data, previous.revision) })
+  else {
+    const result = await owner.run(() => {
+      assertActive()
+      if (canvasSession(path, owner) || canvasDraft(path, owner)) throw new Error('The canvas changed. Inspect its active draft before editing.')
+      return owner.api.vault.writeFileGuarded(path, serializeCanvas(data), previous.baseline)
+    })
+    if (!result.ok) throw new Error('The canvas changed or could not be saved. Your request was not applied.')
   }
-  return { value: { path, data: next, revision: nextRevision }, revert: { label: 'Edit canvas', run: () => restore(previous.data, nextRevision), reapply: () => restore(next, previous.revision) } }
+}
+export async function restoreCanvasTarget(owner: CanvasOwner, path: string, data: CanvasData, revision: string, assertActive = owner.assertActive): Promise<void> {
+  const captured = structuredClone(data)
+  const current = await readCanvasTarget(owner.api, path, owner, assertActive)
+  if (current.revision !== revision) throw new Error('The canvas changed after this edit. Undo would overwrite newer work.')
+  await commitTarget(owner, path, captured, current, assertActive)
+}
+export async function editCanvasTarget(api: ValleyPluginApi, path: string, operation: unknown, expectedRevision?: string, owner = captureCanvasOwner(api), assertActive = owner.assertActive) {
+  assertActive()
+  const accepted = structuredClone(operation)
+  const previous = await readCanvasTarget(api, path, owner, assertActive)
+  if (expectedRevision !== undefined && expectedRevision !== previous.revision) throw new Error('The canvas changed. Inspect it again before editing.')
+  const before = structuredClone(previous.data)
+  const next = applyCanvasOperation(before, accepted)
+  const nextRevision = serializeCanvas(next)
+  await commitTarget(owner, path, next, previous, assertActive)
+  const after = structuredClone(next)
+  return { value: { path, data: next, revision: nextRevision }, revert: { label: 'Edit canvas', run: () => restoreCanvasTarget(owner, path, before, nextRevision, assertActive), reapply: () => restoreCanvasTarget(owner, path, after, previous.revision, assertActive) } }
 }
