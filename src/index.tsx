@@ -11,7 +11,7 @@
  * surface is fully event-driven — no perpetual rAF — so it profiles at 0% CPU idle.
  */
 import type { ValleyPluginApi, ValleyPluginModule } from '@valley/plugin-sdk'
-import { NEW_TAB_ENTRY_V1 } from '@valley/plugin-sdk'
+import { FILE_TREE_CONTEXT_ITEM_V1, NEW_TAB_ENTRY_V1 } from '@valley/plugin-sdk'
 import { initRuntime } from './runtime'
 import { injectStyles } from './styles'
 import { registerCanvasSurfaces } from './surfaces'
@@ -37,7 +37,22 @@ export function register(api: ValleyPluginApi): () => Promise<void> {
     canvasNewTabEntry(() => { if (owner.isActive()) void api.commands.executeOwn('create') })
   )
 
+  const offFileTree = api.interop.extensions.provide(FILE_TREE_CONTEXT_ITEM_V1, {
+    id: 'new-canvas',
+    label: 'New canvas',
+    labelKey: 'plugin.canvas.newTab.create',
+    icon: 'shapes',
+    directories: true,
+    run: async (path) => {
+      const file = path ? await owner.run(() => api.vault.fileInfo(path)) : null
+      owner.assertActive()
+      const folder = file ? path.slice(0, Math.max(0, path.lastIndexOf('/'))) : path
+      await api.commands.executeOwn('create', { folder })
+    }
+  })
+
   return () => {
+    offFileTree()
     offNewTab()
     offCommands()
     offSurfaces()

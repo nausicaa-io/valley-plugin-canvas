@@ -8,6 +8,11 @@
   },
   "provides": [
     {
+      "id": "fileTree.contextItem",
+      "kind": "extension",
+      "version": "1.0.0"
+    },
+    {
       "id": "newTab.entry",
       "kind": "extension",
       "version": "1.0.0"

@@ -2,8 +2,8 @@ import { readdirSync, readFileSync as readStyleFile } from 'node:fs'
 import { join as joinStylePath } from 'node:path'
 import { DEFAULT_PALETTE } from '@valley/plugin-sdk/palette'
 import type { ValleyPluginManifest } from '@valley/plugin-sdk/types'
-import { afterEach, describe, expect, it } from 'vitest'
-import { METADATA_PANEL_SEGMENT_V1, PLUGIN_SURFACE_V1 } from '@valley/plugin-sdk'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { FILE_TREE_CONTEXT_ITEM_V1, METADATA_PANEL_SEGMENT_V1, PLUGIN_SURFACE_V1 } from '@valley/plugin-sdk'
 import { createMockValleyApi } from '@valley/plugin-testkit'
 import * as plugin from '../src/index'
 import manifest from '../manifest.json'
@@ -18,6 +18,26 @@ const declared = { ...manifest, ...config } as unknown as ValleyPluginManifest
 afterEach(() => { document.head.querySelectorAll('style[id]').forEach((style) => style.remove()); delete document.documentElement.dataset.theme })
 
 describe('package host contracts', () => {
+  it.each([
+    ['Boards', null, 'Boards'],
+    ['Boards/Notes.md', { size: 20, mtimeMs: 1 }, 'Boards'],
+    ['Notes.md', { size: 20, mtimeMs: 1 }, ''],
+    ['', null, '']
+  ])('registers New canvas in the target folder for %s', async (path, info, folder) => {
+    const mock = createMockValleyApi({ manifest: declared })
+    const dispose = plugin.register(mock.api)
+    const stat = vi.spyOn(mock.api.vault, 'fileInfo').mockResolvedValue(info)
+    const execute = vi.spyOn(mock.api.commands, 'executeOwn').mockResolvedValue(undefined as never)
+    try {
+      expect(declared.provides?.some((entry) => entry.id === FILE_TREE_CONTEXT_ITEM_V1.id)).toBe(true)
+      const [provider] = mock.api.interop.extensions.providers(FILE_TREE_CONTEXT_ITEM_V1)
+      expect(provider.extension).toMatchObject({ label: 'New canvas', directories: true })
+      await provider.extension.run(path)
+      expect(execute).toHaveBeenCalledWith('create', { folder })
+    } finally { stat.mockRestore(); execute.mockRestore(); await dispose() }
+    expect(mock.api.interop.extensions.providers(FILE_TREE_CONTEXT_ITEM_V1)).toEqual([])
+  })
+
   it('registers attributed command schemas and declared contextual surfaces', async () => {
     const mock = createMockValleyApi({ manifest: declared })
     const dispose = plugin.register(mock.api)
