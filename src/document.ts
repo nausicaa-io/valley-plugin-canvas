@@ -1,6 +1,6 @@
 import type { FileBaseline } from '@valley/plugin-sdk/types'
 import type { PluginFileDraft } from '@valley/plugin-sdk'
-import { parseCanvas, serializeCanvas, type CanvasData } from './canvasModel'
+import { parseCanvas, parseCanvasDocument, serializeCanvas, type CanvasData } from './canvasModel'
 import { canvasState, notifyCanvas } from './session'
 import { type CanvasOwner } from './runtime'
 import { uiText } from './localization'
@@ -10,6 +10,8 @@ export interface CanvasDocumentSnapshot {
   ready: boolean
   busy: boolean
   error: string
+  /** The file is not a JSON Canvas document; it is shown read-only and never written. */
+  invalid: boolean
 }
 const documents = new WeakMap<CanvasOwner, Map<string, CanvasDocument>>()
 export function canvasDocument(owner: CanvasOwner, path: string): CanvasDocument {
@@ -51,7 +53,7 @@ export class CanvasDocument {
     const draft = this.drafts.get(path)
     this.journalReceipt = draft?.journalRevision
     this.baseline = draft?.baseline ?? null; this.written = draft?.lastWritten ?? null; this.dirty = Boolean(draft)
-    this.snapshot = { data: draft?.data ?? { nodes: [], edges: [] }, ready: false, busy: false, error: draft?.error ?? '' }
+    this.snapshot = { data: draft?.data ?? { nodes: [], edges: [] }, ready: false, busy: false, error: draft?.error ?? '', invalid: false }
     this.offFlush = owner.beforeUnload(() => this.flushPending())
     this.offDispose = owner.onDispose(() => { clearTimeout(this.timer); this.offChanged?.(); this.offChanged = undefined; this.listeners.clear() })
   }
@@ -178,7 +180,8 @@ export class CanvasDocument {
           } else if (!this.dirty || !this.snapshot.ready) {
             this.dirty = false
             this.baseline = file.baseline; this.written = file.content; this.revision++
-            this.publish({ data: parseCanvas(file.content), ready: true, error: '' })
+            const parsed = parseCanvasDocument(file.content)
+            this.publish({ data: parsed.data, ready: true, error: '', invalid: !parsed.valid })
           }
           return
         } catch (reason) {
@@ -193,13 +196,13 @@ export class CanvasDocument {
     return task
   }
   setData(data: CanvasData): void {
-    if (!this.owner.isActive() || this.snapshot.busy || !this.snapshot.ready) return
+    if (!this.owner.isActive() || this.snapshot.busy || !this.snapshot.ready || this.snapshot.invalid) return
     this.revision++
     this.publish({ data })
     if (this.dirty) this.retain()
   }
   schedule(data: CanvasData): void {
-    if (!this.owner.isActive() || this.snapshot.busy || !this.snapshot.ready) return
+    if (!this.owner.isActive() || this.snapshot.busy || !this.snapshot.ready || this.snapshot.invalid) return
     this.dirty = true; this.retain()
     void this.checkpoint().catch(() => {})
     clearTimeout(this.timer)
@@ -235,7 +238,7 @@ export class CanvasDocument {
     await this.checkpoint(true)
   }
   flush(data = this.snapshot.data, retry = true): Promise<void> {
-    if (!this.snapshot.ready) return Promise.reject(new Error(this.snapshot.error || uiText('canvas.error.readOnly')))
+    if (!this.snapshot.ready || this.snapshot.invalid) return Promise.reject(new Error(this.snapshot.error || uiText('canvas.error.readOnly')))
     const captured = structuredClone(data)
     const text = serializeCanvas(captured)
     clearTimeout(this.timer)
@@ -256,7 +259,7 @@ export class CanvasDocument {
   }
   commit(data: CanvasData, revision: string): Promise<void> {
     this.owner.assertActive()
-    if (!this.snapshot.ready || this.snapshot.busy) return Promise.reject(new Error(uiText('canvas.error.readOnly')))
+    if (!this.snapshot.ready || this.snapshot.busy || this.snapshot.invalid) return Promise.reject(new Error(uiText('canvas.error.readOnly')))
     if (serializeCanvas(this.snapshot.data) !== revision) return Promise.reject(new Error(uiText('canvas.error.changed')))
     const captured = structuredClone(data)
     clearTimeout(this.timer)
@@ -282,8 +285,7 @@ export class CanvasDocument {
       const file = await this.owner.run(() => this.owner.api.vault.readFileBaseline(this.path))
       if (!current()) return false
       if (!file) throw new Error(uiText('canvas.error.missing'))
-      const parsed = JSON.parse(file.content)
-      if (!parsed || !Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) throw new Error(uiText('canvas.error.save'))
+      const parsed = parseCanvasDocument(file.content)
       clearing = true
       this.publish({ busy: true })
       const receipt = this.journalReceipt
@@ -291,7 +293,7 @@ export class CanvasDocument {
       if (!current()) return false
       this.journalReceipt = null
       this.baseline = file.baseline; this.written = file.content; this.dirty = false; this.revision++
-      this.publish({ data: parseCanvas(file.content), ready: true, error: '' }); this.retain()
+      this.publish({ data: parsed.data, ready: true, error: '', invalid: !parsed.valid }); this.retain()
       return true
     } catch (reason) { if (current()) this.publish({ error: String(reason) }); return false }
     finally { if (clearing) this.publish({ busy: false }) }

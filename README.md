@@ -1,6 +1,6 @@
 # Canvas
 
-Obsidian-style infinite canvas for .canvas files: text, file/image and link cards, groups and arrow connections on a pan/zoom board.
+Infinite canvas for JSON Canvas `.canvas` files: text, note, media and web page cards, groups and connections on a pan/zoom board. Board mechanics follow the common JSON Canvas conventions; everything you see uses Valley's design, and file cards are shown by Valley's own viewers.
 
 This repository owns the plugin’s interface, behavior, dependencies, schemas, tests, translations, and compiled releases. It uses Valley manifest API 5 and the injected SDK 6.
 

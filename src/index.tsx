@@ -1,14 +1,15 @@
 /**
- * Canvas — an Obsidian-style infinite canvas that owns the `.canvas` file type
- * (JSONCanvas, https://jsoncanvas.org). The plugin claims the extension via its
- * manifest `fileViews` map (`{ '.canvas': 'canvas.editor' }`); the host mounts
- * `CanvasEditor` as a full workspace tab whenever a `.canvas` file is opened,
- * passing the vault-relative `relPath`. The editor reads/writes the file through
- * `api.vault` and owns its own debounced persistence + ⌘Z integration.
+ * Canvas — an infinite board that owns the `.canvas` file type (JSON Canvas,
+ * https://jsoncanvas.org). The plugin claims the extension via its manifest
+ * `fileViews` map (`{ '.canvas': 'canvas.editor' }`); the host mounts the view
+ * as a full workspace tab whenever a `.canvas` file is opened, and as its
+ * minimap wherever the file is embedded. The editor reads/writes the file
+ * through `api.vault` and owns its own debounced persistence + ⌘Z integration.
  *
- * Text/markdown, file & image embed, URL and group cards; connections (edges with
- * arrowheads + colors); pan/zoom/select/marquee/drag/resize/recolour/delete. The
- * surface is fully event-driven — no perpetual rAF — so it profiles at 0% CPU idle.
+ * Text, note, media, web page and group cards; connections (edges with
+ * arrowheads + colours); pan/zoom/select/marquee/drag/resize/recolour/align.
+ * Card content is shown by Valley's own viewers through the SDK. The surface
+ * is fully event-driven — no perpetual rAF — so it profiles at 0% CPU idle.
  */
 import type { ValleyPluginApi, ValleyPluginModule } from '@valley/plugin-sdk'
 import { FILE_TREE_CONTEXT_ITEM_V1, NEW_TAB_ENTRY_V1 } from '@valley/plugin-sdk'
@@ -17,7 +18,7 @@ import { injectStyles } from './styles'
 import { registerCanvasSurfaces } from './surfaces'
 import { registerCanvasCommands } from './commands'
 import { canvasNewTabEntry } from './newTabEntry'
-import CanvasEditor from './CanvasEditor'
+import CanvasView from './CanvasEditor'
 import { initLocalization } from './localization'
 
 export function register(api: ValleyPluginApi): () => Promise<void> {
@@ -25,9 +26,9 @@ export function register(api: ValleyPluginApi): () => Promise<void> {
   const owner = initRuntime(api)
   const disposeStyles = injectStyles()
 
-  // The host mounts this file view with a `relPath` prop (see TabView); cast
-  // through the registry's propless `ComponentType` slot.
-  api.registerView('canvas.editor', CanvasEditor as unknown as Parameters<typeof api.registerView>[1])
+  // The host mounts this file view with `relPath` (+ `tab` in a workspace tab,
+  // `thisPath` when embedded); cast through the registry's propless slot.
+  api.registerView('canvas.editor', CanvasView as unknown as Parameters<typeof api.registerView>[1])
   const offCommands = registerCanvasCommands(api, owner)
   const offSurfaces = registerCanvasSurfaces(api, owner)
   // The owner-scoped bus applies the same guard policy as the palette, CLI and

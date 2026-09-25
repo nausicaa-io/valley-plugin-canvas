@@ -3,6 +3,13 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import {
   CANVAS_PRESET_PALETTE,
+  fileSubpath,
+  groupBackground,
+  parseCanvasDocument,
+  validEnd,
+  validSide,
+  type FileNode,
+  type GroupNode,
   addEdge,
   addNode,
   createFileNode,
@@ -58,10 +65,12 @@ describe('parseCanvas / serializeCanvas', () => {
     expect(parseCanvas(text)).toEqual(sample)
   })
 
-  it('produces pretty JSON with a trailing newline', () => {
+  it('writes the tab-indented, one-entry-per-line JSON Canvas layout', () => {
     const text = serializeCanvas(sample)
-    expect(text.endsWith('\n')).toBe(true)
-    expect(text).toContain('\n  "nodes"')
+    expect(text.startsWith('{\n\t"nodes":[\n\t\t{')).toBe(true)
+    expect(text.endsWith('\n\t]\n}')).toBe(true)
+    expect(text.split('\n').filter((line) => line.startsWith('\t\t{'))).toHaveLength(sample.nodes.length + sample.edges.length)
+    expect(serializeCanvas({ nodes: [], edges: [] })).toBe('{\n\t"nodes":[],\n\t"edges":[]\n}')
   })
 
   it('drops nodes without an id or with an unknown type', () => {
@@ -177,7 +186,7 @@ describe('resolveColor', () => {
   // and a user's .valley/design/*.css override.
   it('maps presets to palette variables, passes hex through, rejects the rest', () => {
     expect(resolveColor('1')).toBe('var(--color-red)')
-    expect(resolveColor('6')).toBe('var(--color-violet)')
+    expect(resolveColor('6')).toBe('var(--color-purple)')
     expect(resolveColor('#abcdef')).toBe('#abcdef')
     expect(resolveColor(undefined)).toBeNull()
     expect(resolveColor('99')).toBeNull()
@@ -185,7 +194,7 @@ describe('resolveColor', () => {
 
   it('covers all six presets with a real palette id', () => {
     const ids = Object.values(CANVAS_PRESET_PALETTE)
-    expect(ids).toEqual(['red', 'orange', 'yellow', 'green', 'cyan', 'violet'])
+    expect(ids).toEqual(['red', 'orange', 'yellow', 'green', 'cyan', 'purple'])
     for (const key of Object.keys(CANVAS_PRESET_PALETTE)) {
       expect(resolveColor(key)).toMatch(/^var\(--color-[a-z]+\)$/)
     }
@@ -195,7 +204,7 @@ describe('resolveColor', () => {
 /**
  * The one test that checks us against the format rather than against our own
  * idea of it. `sample.canvas` is vendored verbatim from the spec repo
- * (github.com/obsidianmd/jsoncanvas, MIT) and must stay byte-identical.
+ * (the JSON Canvas repository, MIT) and must stay byte-identical.
  */
 describe('the official JSON Canvas sample', () => {
   const raw = readFileSync(
@@ -246,9 +255,11 @@ describe('group background', () => {
     }
   })
 
-  it('drops an unknown backgroundStyle rather than rendering it', () => {
-    expect(withBg('parallax').backgroundStyle).toBeUndefined()
-    expect(withBg(7).backgroundStyle).toBeUndefined()
+  it('keeps an unknown backgroundStyle on disk and paints it as cover', () => {
+    expect(withBg('parallax').backgroundStyle).toBe('parallax')
+    expect(groupBackground(withBg('parallax') as unknown as GroupNode)).toEqual({ file: 'Images/a.png', style: 'cover' })
+    expect(groupBackground(withBg(7) as unknown as GroupNode)).toEqual({ file: 'Images/a.png', style: 'cover' })
+    expect(groupBackground(withBg('ratio') as unknown as GroupNode)).toEqual({ file: 'Images/a.png', style: 'ratio' })
   })
 })
 
@@ -261,10 +272,11 @@ describe('file subpath', () => {
       })
     ).nodes[0] as unknown) as Record<string, unknown>
 
-  it('keeps a subpath that starts with # and ignores one that does not', () => {
-    expect(parseFile('#Heading').subpath).toBe('#Heading')
-    expect(parseFile('#^abc123').subpath).toBe('#^abc123')
-    expect(parseFile('Heading').subpath).toBeUndefined()
+  it('reads a subpath that starts with # and keeps one that does not without using it', () => {
+    expect(fileSubpath(parseFile('#Heading') as unknown as FileNode)).toBe('#Heading')
+    expect(fileSubpath(parseFile('#^abc123') as unknown as FileNode)).toBe('#^abc123')
+    expect(parseFile('Heading').subpath).toBe('Heading')
+    expect(fileSubpath(parseFile('Heading') as unknown as FileNode)).toBeUndefined()
   })
 
   const doc = [
@@ -326,14 +338,14 @@ describe('edge enum tolerance', () => {
     expect(e.toEnd).toBe('none')
   })
 
-  it('drops a side or end outside its enum instead of carrying it', () => {
+  it('keeps a side or end outside its enum on disk but never draws with it', () => {
     const e = parseEdge({ fromSide: 'sideways', toSide: 7, fromEnd: 'circle', toEnd: null })
-    expect(e.fromSide).toBeUndefined()
-    expect(e.toSide).toBeUndefined()
-    expect(e.fromEnd).toBeUndefined()
-    expect(e.toEnd).toBeUndefined()
-    // …and the dropped value does not come back on save.
-    expect(serializeCanvas({ nodes: [], edges: [e] })).not.toContain('sideways')
+    expect(validSide(e.fromSide)).toBeUndefined()
+    expect(validSide(e.toSide)).toBeUndefined()
+    expect(validEnd(e.fromEnd)).toBeUndefined()
+    expect(validEnd(e.toEnd)).toBeUndefined()
+    // Another tool's value survives a save.
+    expect(serializeCanvas({ nodes: [], edges: [e] })).toContain('sideways')
   })
 })
 
@@ -412,4 +424,38 @@ it('duplicates internal connections with fresh ids and preserves their attribute
   expect(ids.has(data.edges[1].toNode)).toBe(true)
   expect(data.edges[1].id).not.toBe(sample.edges[0].id)
   expect(duplicateNodes(sample, new Set(['a'])).data.edges).toHaveLength(1)
+})
+
+describe('lossless round trips', () => {
+  it('reports text that is not a JSON Canvas document as invalid instead of an empty board', () => {
+    expect(parseCanvasDocument('{"nodes":[').valid).toBe(false)
+    expect(parseCanvasDocument('[1,2]').valid).toBe(false)
+    expect(parseCanvasDocument('{"nodes":{}}').valid).toBe(false)
+    expect(parseCanvasDocument('').valid).toBe(true)
+    expect(parseCanvasDocument('{}')).toEqual({ valid: true, data: { nodes: [], edges: [] } })
+  })
+
+  it('keeps entries it cannot use, and unknown top-level keys, where they were', () => {
+    const text = serializeCanvas({ nodes: [], edges: [] }).replace('"nodes":[]', '"nodes":[{"id":"a","type":"text","x":0,"y":0,"width":10,"height":10,"text":"A"},{"id":"s","type":"sticker","x":0,"y":0,"width":5,"height":5},{"type":"text","text":"no id"},{"id":"a","type":"text","x":1,"y":1,"width":1,"height":1,"text":"duplicate"}]').replace('"edges":[]', '"edges":[{"fromNode":"a","toNode":"s"},{"id":"e","fromNode":"a","toNode":"s"}],"metadata":{"v":"1.1"}')
+    const parsed = parseCanvasDocument(text)
+    expect(parsed.valid).toBe(true)
+    expect(parsed.data.nodes.map((node) => node.id)).toEqual(['a'])
+    expect(parsed.data.edges.map((edge) => edge.id)).toEqual(['e'])
+    const saved = JSON.parse(serializeCanvas(moveNodes(parsed.data, new Set(['a']), 5, 5)))
+    expect(saved.nodes.map((node: { id?: string; text?: string }) => node.id ?? node.text)).toEqual(['a', 's', 'no id', 'a'])
+    expect(saved.nodes[3].text).toBe('duplicate')
+    expect(saved.nodes[0].x).toBe(5)
+    expect(saved.edges).toHaveLength(2)
+    expect(saved.metadata).toEqual({ v: '1.1' })
+  })
+
+  it('does not add a label to a group that has none', () => {
+    const data = parseCanvas('{"nodes":[{"id":"g","type":"group","x":0,"y":0,"width":10,"height":10}],"edges":[]}')
+    expect(JSON.parse(serializeCanvas(data)).nodes[0]).not.toHaveProperty('label')
+  })
+
+  it('writes the vendored spec sample back byte for byte', () => {
+    const text = readFileSync(resolve(__dirname, 'fixtures/sample.canvas'), 'utf8')
+    expect(serializeCanvas(parseCanvas(text))).toBe(text.replace(/\n$/, ''))
+  })
 })

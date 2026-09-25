@@ -10,6 +10,7 @@ export interface CanvasSnapshot {
   edgeId: string | null
   readOnly: boolean
   ready: boolean
+  invalid?: boolean
   revision: string
   error: string
 }

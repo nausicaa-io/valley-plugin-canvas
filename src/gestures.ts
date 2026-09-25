@@ -1,15 +1,22 @@
 import type { MutableRefObject, RefObject } from 'react'
 import { React, api } from './runtime'
-import { addEdge, addNode, createTextNode, duplicateNodes, genId, nodeById, removeEdges, setNodePositions, setNodeRect, type CanvasData, type CanvasEdge, type CanvasNode, type CanvasNodeType, type EdgeSide } from './canvasModel'
-import { chooseSide, gridSpacing, nodeRect, rectFromPoints, rectsIntersect, resizeRect, screenToWorld, sideAnchor, snap as snapValue, snapToObjects, type Point, type ResizeHandle, type SnapGuide, type Viewport } from './geometry'
+import { addEdge, addNode, createTextNode, duplicateNodes, genId, nodeById, removeEdges, setNodePositions, setNodeRect, validSide, type CanvasData, type CanvasEdge, type CanvasNode, type EdgeSide } from './canvasModel'
+import { chooseSide, gridSpacing, nodeRect, rectFromPoints, rectsIntersect, resizeRect, screenToWorld, sideAnchor, snap as snapValue, snapToObjects, type Point, type Rect, type ResizeHandle, type SnapGuide, type Viewport } from './geometry'
 import type { ConnectPreview } from './edges'
+import type { CreateKind } from './menus'
 import type { useCanvasViewport } from './viewport'
 import type { useCanvasSelection } from './selection'
 import { uiText } from './localization'
 
-const MIN_NODE = 60
+const MIN_NODE = 50
 const MOVE_THRESHOLD = 3
-const SNAP_PX = 8
+const SNAP_PX = 15
+const isMac = typeof navigator !== 'undefined' && /mac/i.test(navigator.platform)
+/** Dragging with this key held clones the cards (⌥ on macOS, Ctrl elsewhere). */
+const cloneKey = (e: { altKey: boolean; ctrlKey: boolean }): boolean => isMac ? e.altKey : e.ctrlKey
+/** Holding this key suspends snapping (⌃ on macOS, Alt elsewhere). */
+const noSnapKey = (e: { altKey: boolean; ctrlKey: boolean }): boolean => isMac ? e.ctrlKey : e.altKey
+const modKey = (e: { metaKey: boolean; ctrlKey: boolean }): boolean => isMac ? e.metaKey : e.ctrlKey
 
 /**
  * Pointer capture is a best-effort convenience — it keeps a drag alive when the
@@ -25,12 +32,13 @@ function capturePointer(el: HTMLElement | null, pointerId: number): void {
   }
 }
 
-/** Default size of a card dropped out of the create menu, per type. */
-export const GHOST_SIZE: Record<CanvasNodeType, { width: number; height: number }> = {
-  text: { width: 250, height: 120 },
-  file: { width: 400, height: 400 },
-  link: { width: 400, height: 300 },
-  group: { width: 350, height: 250 }
+/** Default size of a card dropped out of the create menu, per kind. */
+export const GHOST_SIZE: Record<CreateKind, { width: number; height: number }> = {
+  text: { width: 250, height: 60 },
+  note: { width: 400, height: 400 },
+  media: { width: 400, height: 400 },
+  link: { width: 400, height: 400 },
+  group: { width: 400, height: 400 }
 }
 
 type Interaction =
@@ -40,7 +48,11 @@ type Interaction =
   | { type: 'resize'; id: string; handle: ResizeHandle; startRect: { x: number; y: number; width: number; height: number }; startWorld: Point; moved: boolean }
   | { type: 'connect'; fromNode: string; fromSide: EdgeSide; fromAnchor: Point; edgeId?: string; end?: 'from' | 'to' }
   /** Dragging a card out of the create menu. `engaged` gates pointer capture. */
-  | { type: 'create'; kind: CanvasNodeType; startScreen: Point; engaged: boolean }
+  | { type: 'create'; kind: CreateKind; startScreen: Point; engaged: boolean }
+  /** Mod-drag on the board: draw the size of a card, then pick its kind. */
+  | { type: 'create-rect'; startScreen: Point }
+  /** Press on a connection: a click selects it, a drag moves its nearer end. */
+  | { type: 'edge'; edge: CanvasEdge; startScreen: Point }
 
 interface GestureOptions {
   rootRef: RefObject<HTMLDivElement>
@@ -52,15 +64,18 @@ interface GestureOptions {
   apply(next: CanvasData, label: string): void
   pushUndo(label: string, previous: CanvasData, next: CanvasData): void
   scheduleSave(next: CanvasData): void
-  addOfKind(kind: CanvasNodeType, at?: Point): void
+  addOfKind(kind: CreateKind, at?: Point): void
+  /** A Mod-drag finished: offer the card kinds for `rect` (world) at the pointer. */
+  onCreateRect(rect: Rect, client: Point): void
 }
 
-export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, selection, setModelBoth, apply, pushUndo, scheduleSave, addOfKind }: GestureOptions) {
+export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, selection, setModelBoth, apply, pushUndo, scheduleSave, addOfKind, onCreateRect }: GestureOptions) {
   const { viewportRef, spaceRef, localPoint, worldAt, setViewport } = viewport
   const { selectionRef, editingRef, replaceSelection, expandWithGroups, setSelectedEdge, setEditingId, setEditingEdgeLabel } = selection
   const [marquee, setMarquee] = React.useState<{ x: number; y: number; width: number; height: number } | null>(null)
   const [preview, setPreview] = React.useState<ConnectPreview | null>(null)
-  const [ghost, setGhost] = React.useState<{ kind: CanvasNodeType; x: number; y: number } | null>(null)
+  const [ghost, setGhost] = React.useState<{ kind: CreateKind; x: number; y: number } | null>(null)
+  const [panning, setPanning] = React.useState(false)
   const [snapGuides, setSnapGuides] = React.useState<SnapGuide[]>([])
   const [draggingIds, setDraggingIds] = React.useState<Set<string>>(new Set())
   const interactionRef = React.useRef<Interaction | null>(null)
@@ -76,11 +91,30 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
     const screen = localPoint(e.clientX, e.clientY)
     if (spaceRef.current || e.button === 1) {
       interactionRef.current = { type: 'pan', startScreen: screen, origin: viewportRef.current }
+      setPanning(true)
       return
     }
     setSelectedEdge(null)
     if (!e.shiftKey) replaceSelection(new Set())
-    interactionRef.current = { type: 'marquee', startScreen: screen, additive: e.shiftKey }
+    interactionRef.current = modKey(e) && !readOnlyRef.current ? { type: 'create-rect', startScreen: screen } : { type: 'marquee', startScreen: screen, additive: e.shiftKey }
+  }
+
+  /** Press on the box around a multi-card selection: drag the whole selection. */
+  const onSelectionPointerDown = (e: React.PointerEvent): void => {
+    const first = [...selectionRef.current].map((id) => nodeById(modelRef.current, id)).find(Boolean)
+    if (!first) return
+    if (e.shiftKey) { onRootPointerDown(e); return }
+    onNodePointerDown(e, first)
+  }
+
+  const onEdgePointerDown = (e: React.PointerEvent, edge: CanvasEdge): void => {
+    if (e.button !== 0) return
+    e.stopPropagation()
+    rootRef.current?.focus()
+    setEditingEdgeLabel(null)
+    if (!e.shiftKey) replaceSelection(new Set())
+    setSelectedEdge(edge.id)
+    if (!readOnlyRef.current) interactionRef.current = { type: 'edge', edge, startScreen: localPoint(e.clientX, e.clientY) }
   }
 
   // ── Gesture: node pointer down (select + start drag) ─────────────────────────
@@ -88,11 +122,14 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
     if (spaceRef.current || e.button === 1) {
       e.preventDefault(); e.stopPropagation(); capturePointer(rootRef.current, e.pointerId)
       interactionRef.current = { type: 'pan', startScreen: localPoint(e.clientX, e.clientY), origin: viewportRef.current }
+      setPanning(true)
       return
     }
     if (e.button !== 0) return
     if (editingRef.current === node.id) return
     e.stopPropagation()
+    // Pressing another card ends the edit in progress (its editor commits on unmount).
+    if (editingRef.current) setEditingId(null)
     setSelectedEdge(null)
     setEditingEdgeLabel(null)
     rootRef.current?.focus()
@@ -108,8 +145,8 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
     // Read-only: selection is allowed, but never start a move.
     if (readOnlyRef.current) return
 
-    const beforeDuplicate = e.altKey ? modelRef.current : undefined
-    if (e.altKey) {
+    const beforeDuplicate = cloneKey(e) ? modelRef.current : undefined
+    if (beforeDuplicate) {
       const duplicated = duplicateNodes(modelRef.current, expandWithGroups(ids), 0)
       setModelBoth(duplicated.data)
       ids = duplicated.ids
@@ -162,12 +199,12 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
 
   const onReconnect = (e: React.PointerEvent, edge: CanvasEdge, end: 'from' | 'to'): void => {
     e.stopPropagation()
-    if (readOnlyRef.current || e.button !== 0) return
+    if (readOnlyRef.current || (e.type === 'pointerdown' && e.button !== 0)) return
     e.preventDefault()
     const fixed = nodeById(modelRef.current, end === 'from' ? edge.toNode : edge.fromNode)
     const moving = nodeById(modelRef.current, end === 'from' ? edge.fromNode : edge.toNode)
     if (!fixed || !moving) return
-    const side = (end === 'from' ? edge.toSide : edge.fromSide) ?? chooseSide(nodeRect(fixed), nodeRect(moving))
+    const side = validSide(end === 'from' ? edge.toSide : edge.fromSide) ?? chooseSide(nodeRect(fixed), nodeRect(moving))
     const anchor = sideAnchor(nodeRect(fixed), side)
     capturePointer(rootRef.current, e.pointerId)
     interactionRef.current = { type: 'connect', fromNode: fixed.id, fromSide: side, fromAnchor: anchor, edgeId: edge.id, end }
@@ -180,7 +217,7 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
    * swallow the button's own `click` and kill the click-to-create fallback
    * (AGENTS.md — the same bug the To-Do swipe row hit). It engages on move.
    */
-  const onCreateStart = (e: React.PointerEvent, kind: CanvasNodeType): void => {
+  const onCreateStart = (e: React.PointerEvent, kind: CreateKind): void => {
     if (e.button !== 0 || readOnlyRef.current) return
     interactionRef.current = { type: 'create', kind, startScreen: localPoint(e.clientX, e.clientY), engaged: false }
   }
@@ -188,11 +225,11 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
   // ── Gesture move ─────────────────────────────────────────────────────────────
   // Snap to the grid you can actually see: the spacing steps with zoom, so a
   // card dropped while zoomed out lands on the coarse dots under the cursor
-  // rather than on a fine grid nothing is drawing. Obsidian snaps to its own
-  // `gridSpacing` for the same reason, which is why the spacing is no longer a
-  // setting — a number the user picks cannot track the zoom.
+  // rather than on a fine grid nothing is drawing — which is why the spacing
+  // is not a setting: a number the user picks cannot track the zoom.
+  const snapping = React.useRef(true)
   const gridSnap = (v: number): number => (
-    api.settings.get().snapToGrid && !spaceRef.current ? snapValue(v, gridSpacing(viewportRef.current.zoom)) : v
+    api.settings.get().snapToGrid && snapping.current && !spaceRef.current ? snapValue(v, gridSpacing(viewportRef.current.zoom)) : v
   )
 
   const onRootPointerMove = (e: React.PointerEvent): void => {
@@ -203,6 +240,23 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
       return
     }
     const screen = localPoint(e.clientX, e.clientY)
+    snapping.current = !noSnapKey(e)
+    if (it.type === 'edge') {
+      if (Math.hypot(screen.x - it.startScreen.x, screen.y - it.startScreen.y) <= MOVE_THRESHOLD) return
+      const from = nodeById(modelRef.current, it.edge.fromNode)
+      const to = nodeById(modelRef.current, it.edge.toNode)
+      if (!from || !to) { interactionRef.current = null; return }
+      const start = screenToWorld(viewportRef.current, it.startScreen.x, it.startScreen.y)
+      const fromAnchor = sideAnchor(nodeRect(from), validSide(it.edge.fromSide) ?? chooseSide(nodeRect(from), nodeRect(to)))
+      const toAnchor = sideAnchor(nodeRect(to), validSide(it.edge.toSide) ?? chooseSide(nodeRect(to), nodeRect(from)))
+      const end = Math.hypot(start.x - fromAnchor.x, start.y - fromAnchor.y) < Math.hypot(start.x - toAnchor.x, start.y - toAnchor.y) ? 'from' : 'to'
+      onReconnect(e, it.edge, end)
+      return
+    }
+    if (it.type === 'create-rect') {
+      setMarquee(rectFromPoints(it.startScreen, screen))
+      return
+    }
     if (it.type === 'create') {
       if (!it.engaged) {
         if (Math.hypot(screen.x - it.startScreen.x, screen.y - it.startScreen.y) <= MOVE_THRESHOLD) return
@@ -242,7 +296,7 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
       let sdx = 0
       let sdy = 0
       let guides: SnapGuide[] = []
-      if (!spaceRef.current && api.settings.get().snapToObjects !== false) {
+      if (!spaceRef.current && snapping.current && api.settings.get().snapToObjects !== false) {
         const start = it.startPositions.get(it.primary)
         const prim = nodeById(gestureStartRef.current, it.primary)
         if (start && prim) {
@@ -280,7 +334,18 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
     interactionRef.current = null
     if (snapGuides.length) setSnapGuides([])
     if (draggingIds.size) setDraggingIds(new Set())
+    setPanning(false)
     if (!it) return
+    if (it.type === 'edge') return
+    if (it.type === 'create-rect') {
+      const screen = localPoint(e.clientX, e.clientY)
+      setMarquee(null)
+      const a = screenToWorld(viewportRef.current, it.startScreen.x, it.startScreen.y)
+      const b = screenToWorld(viewportRef.current, screen.x, screen.y)
+      const box = rectFromPoints(a, b)
+      if (box.width >= MIN_NODE && box.height >= MIN_NODE) onCreateRect(box, { x: e.clientX, y: e.clientY })
+      return
+    }
     if (it.type === 'create') {
       setGhost(null)
       // Not engaged = a plain click; the button's own onClick creates it centered.
@@ -330,7 +395,7 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
         setSelectedEdge(null)
       } else if (!target) {
         const point = worldAt(e)
-        const card = createTextNode(point.x, point.y)
+        const card = createTextNode(point.x - 125, point.y - 30)
         const from = nodeById(modelRef.current, it.fromNode)
         if (from) {
           const next = addNode(modelRef.current, card)
@@ -351,8 +416,8 @@ export function useCanvasGestures({ rootRef, modelRef, readOnlyRef, viewport, se
     const interaction = interactionRef.current
     if (interaction?.type === 'drag' || interaction?.type === 'resize') setModelBoth(interaction.type === 'drag' && interaction.before ? interaction.before : gestureStartRef.current)
     interactionRef.current = null
-    setPreview(null); setMarquee(null); setDraggingIds(new Set()); setSnapGuides([]); setGhost(null)
+    setPreview(null); setMarquee(null); setDraggingIds(new Set()); setSnapGuides([]); setGhost(null); setPanning(false)
   }
 
-  return { marquee, preview, ghost, snapGuides, draggingIds, onRootPointerDown, onRootPointerMove, onRootPointerUp, onNodePointerDown, onResizeStart, onConnectStart, onReconnect, onCreateStart, cancelInteraction }
+  return { marquee, preview, ghost, snapGuides, draggingIds, panning, onRootPointerDown, onRootPointerMove, onRootPointerUp, onNodePointerDown, onResizeStart, onConnectStart, onReconnect, onCreateStart, onEdgePointerDown, onSelectionPointerDown, cancelInteraction }
 }

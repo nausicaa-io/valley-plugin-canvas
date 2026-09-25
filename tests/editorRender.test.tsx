@@ -5,9 +5,13 @@ import { canvasSession, canvasDraft } from '../src/session'
 import { editCanvasTarget } from '../src/commands'
 import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { withHostUi } from './support/hostUi'
 import { createMockValleyApi, type MockValleyApi } from '@valley/plugin-testkit'
 import { initRuntime } from '../src/runtime'
 import CanvasEditor from '../src/CanvasEditor'
+
+/** A workspace tab: the file view renders the editor, not the embedded minimap. */
+const TAB = { id: 'tab-1', kind: 'file', path: 'Test.canvas' }
 import { parseCanvas, serializeCanvas, type CanvasData } from '../src/canvasModel'
 
 const oneCard: CanvasData = {
@@ -32,9 +36,9 @@ describe('CanvasEditor', () => {
   let mock: MockValleyApi
 
   function mountWith(files: Record<string, string>): ReturnType<typeof render> {
-    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files })
+    mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files }))
     initRuntime(mock.api)
-    return render(<CanvasEditor relPath="Test.canvas" />)
+    return render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
   }
 
   beforeEach(() => {
@@ -43,12 +47,12 @@ describe('CanvasEditor', () => {
   })
 
   it('keeps a command selection queued before the file editor first mounts', async () => {
-    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(oneCard) } })
+    mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(oneCard) } }))
     initRuntime(mock.api)
     const off = registerCanvasSurfaces(mock.api)
     const result = await mock.api.commands.execute('canvas:open', { path: 'Test.canvas', nodeIds: ['a'] })
     expect(result.ok).toBe(true)
-    render(<CanvasEditor relPath="Test.canvas" />)
+    render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
     await waitFor(() => expect(canvasSession('Test.canvas')?.get().nodeIds).toEqual(['a']))
     const provider = mock.api.interop.extensions.providers(PLUGIN_SURFACE_V1)[0].extension
     expect(provider.getSnapshot('Test.canvas').item).toMatchObject({ id: 'a', state: { path: 'Test.canvas', nodeIds: ['a'] } })
@@ -77,57 +81,58 @@ describe('CanvasEditor', () => {
     expect(root.setPointerCapture).not.toHaveBeenCalled()
     const input = await screen.findByDisplayValue('Hello canvas')
     fireEvent.change(input, { target: { value: 'Edited by double-click' } })
-    fireEvent.blur(input)
+    fireEvent.keyDown(input, { key: 'Escape' })
     await act(async () => { await mock.runBeforeUnload() })
     expect(parseCanvas(await mock.api.vault.readFile('Test.canvas')).nodes[0]).toMatchObject({ id: 'a', text: 'Edited by double-click', x: 0, y: 0 })
   })
 
-  it.each([false, true])('cancels a pending card drag released outside the canvas before later hover (duplicate=%s)', async (altKey) => {
+  // jsdom reports no platform, so cloning uses the non-macOS key (Ctrl).
+  it.each([false, true])('cancels a pending card drag released outside the canvas before later hover (duplicate=%s)', async (ctrlKey) => {
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
     await screen.findByText('Hello canvas')
     const root = container.querySelector('.canvas-root') as HTMLElement
     const card = container.querySelector('[data-node-id="a"]') as HTMLElement
     root.setPointerCapture = vi.fn()
-    fireEvent.pointerDown(card, { button: 0, pointerId: 6, clientX: 10, clientY: 10, altKey })
+    fireEvent.pointerDown(card, { button: 0, pointerId: 6, clientX: 10, clientY: 10, ctrlKey })
     fireEvent.pointerUp(document.body, { pointerId: 6, clientX: 12, clientY: 10 })
     fireEvent.pointerMove(card, { pointerId: 6, buttons: 0, clientX: 90, clientY: 90 })
     fireEvent.pointerMove(card, { pointerId: 6, buttons: 0, clientX: 110, clientY: 110 })
     expect(root.setPointerCapture).not.toHaveBeenCalled()
     expect(canvasSession('Test.canvas')!.get().data).toEqual(oneCard)
-    expect(container.querySelector('.canvas-node.dragging')).toBeNull()
+    expect(container.querySelector('.canvas-node.is-dragging')).toBeNull()
     await act(async () => { await mock.runBeforeUnload() })
     expect(mock.api.vault.writeFileGuarded).not.toHaveBeenCalled()
     expect(parseCanvas(await mock.api.vault.readFile('Test.canvas'))).toEqual(oneCard)
   })
 
-  it.each([false, true])('captures and saves a real card drag after the movement threshold (duplicate=%s)', async (altKey) => {
+  it.each([false, true])('captures and saves a real card drag after the movement threshold (duplicate=%s)', async (ctrlKey) => {
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
     await screen.findByText('Hello canvas')
     const root = container.querySelector('.canvas-root') as HTMLElement
     const card = container.querySelector('[data-node-id="a"]') as HTMLElement
     root.setPointerCapture = vi.fn()
-    fireEvent.pointerDown(card, { button: 0, pointerId: 8, clientX: 10, clientY: 10, altKey })
+    fireEvent.pointerDown(card, { button: 0, pointerId: 8, clientX: 10, clientY: 10, ctrlKey })
     expect(root.setPointerCapture).not.toHaveBeenCalled()
     const selected = canvasSession('Test.canvas')!.get().nodeIds
     expect(selected).toHaveLength(1)
-    if (altKey) expect(selected[0]).not.toBe('a')
+    if (ctrlKey) expect(selected[0]).not.toBe('a')
     fireEvent.pointerMove(card, { pointerId: 8, buttons: 1, clientX: 14, clientY: 10 })
     expect(root.setPointerCapture).toHaveBeenCalledTimes(1)
     expect(root.setPointerCapture).toHaveBeenCalledWith(8)
     fireEvent.pointerMove(root, { pointerId: 8, buttons: 1, clientX: 80, clientY: 50 })
     expect(root.setPointerCapture).toHaveBeenCalledTimes(1)
-    expect(container.querySelector(`[data-node-id="${selected[0]}"]`)).toHaveClass('dragging')
+    expect(container.querySelector(`[data-node-id="${selected[0]}"]`)).toHaveClass('is-dragging')
     fireEvent.pointerUp(root, { pointerId: 8, clientX: 80, clientY: 50 })
     await act(async () => { await mock.runBeforeUnload() })
     const saved = parseCanvas(await mock.api.vault.readFile('Test.canvas'))
-    expect(saved.nodes).toHaveLength(altKey ? 2 : 1)
+    expect(saved.nodes).toHaveLength(ctrlKey ? 2 : 1)
     expect(saved.nodes.find(node => node.id === selected[0])).toMatchObject({ x: 70, y: 40 })
-    if (altKey) expect(saved.nodes.find(node => node.id === 'a')).toEqual(oneCard.nodes[0])
-    expect(container.querySelector('.canvas-node.dragging')).toBeNull()
+    if (ctrlKey) expect(saved.nodes.find(node => node.id === 'a')).toEqual(oneCard.nodes[0])
+    expect(container.querySelector('.canvas-node.is-dragging')).toBeNull()
   })
 
   it('rereads a file changed while its initial canvas load is pending', async () => {
-    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(oneCard) } })
+    mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(oneCard) } }))
     const original = await mock.api.vault.readFileBaseline('Test.canvas')
     let complete!: (file: typeof original) => void
     const read = vi.spyOn(mock.api.vault, 'readFileBaseline')
@@ -135,7 +140,7 @@ describe('CanvasEditor', () => {
     const newest = { ...oneCard, nodes: [{ ...oneCard.nodes[0], text: 'Newest initial canvas' }] }
     read.mockResolvedValueOnce({ ...original!, content: serializeCanvas(newest) })
     initRuntime(mock.api)
-    render(<CanvasEditor relPath="Test.canvas" />)
+    render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
     await waitFor(() => expect(read).toHaveBeenCalledTimes(1))
     act(() => mock.emitVaultChanged({ changes: [{ relPath: 'Test.canvas', kind: 'change' }] }))
     await act(async () => { complete(original) })
@@ -194,7 +199,7 @@ describe('CanvasEditor', () => {
     fireEvent.doubleClick(body)
     const textarea = await screen.findByDisplayValue('Hello canvas')
     fireEvent.change(textarea, { target: { value: 'Retained edit' } })
-    fireEvent.blur(textarea)
+    fireEvent.keyDown(textarea, { key: 'Escape' })
     await act(async () => { complete({ ...original!, content: serializeCanvas({ nodes: [], edges: [] }) }) })
     expect(canvasSession('Test.canvas')?.get().data.nodes[0]).toMatchObject({ text: 'Retained edit' })
     expect(canvasDraft('Test.canvas')?.baseline).toEqual(original?.baseline)
@@ -205,7 +210,7 @@ describe('CanvasEditor', () => {
   it('offers eight border resize targets before selection and cancels a gesture without writing', async () => {
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
     await screen.findByText('Hello canvas')
-    const handles = container.querySelectorAll('.canvas-handle')
+    const handles = container.querySelectorAll('.canvas-node-resizer')
     expect(handles).toHaveLength(8)
     const root = container.querySelector('.canvas-root')!
     fireEvent.pointerDown(handles[0], { button: 0, pointerId: 1, clientX: 20, clientY: 20 })
@@ -236,10 +241,10 @@ describe('CanvasEditor', () => {
     document.body.append(frame)
     const owner = frame.contentWindow!
     const container = frame.contentDocument!.body.appendChild(frame.contentDocument!.createElement('div'))
-    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(oneCard) } })
+    mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(oneCard) } }))
     initRuntime(mock.api)
     const remove = vi.spyOn(owner, 'removeEventListener')
-    const mounted = render(<CanvasEditor relPath="Test.canvas" />, { container })
+    const mounted = render(<CanvasEditor relPath="Test.canvas" tab={TAB} />, { container })
     try {
       await waitFor(() => expect(container.textContent).toContain('Hello canvas'))
       const root = container.querySelector('.canvas-root')!
@@ -285,7 +290,7 @@ describe('CanvasEditor', () => {
     const remove = vi.spyOn(root, 'removeEventListener')
     for (const offset of [10, 100]) {
       left = offset
-      rerender(<CanvasEditor relPath="Test.canvas" />)
+      rerender(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
       const before = canvasSession('Test.canvas')!.get().viewport
       fireEvent.wheel(root, { clientX: left + 50, clientY: 45, ctrlKey: true, deltaY: 30 })
       const after = canvasSession('Test.canvas')!.get().viewport
@@ -300,11 +305,11 @@ describe('CanvasEditor', () => {
 
   it('passes the containing Canvas as the context of an embedded Base', async () => {
     const data: CanvasData = { nodes: [{ id: 'base', type: 'file', file: 'Context.base', subpath: '#Same date', x: 0, y: 0, width: 500, height: 300 }], edges: [] }
-    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(data) } })
+    mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(data), 'Context.base': 'views: []\n' } }))
     const preview = vi.fn((_props: { relPath: string; sourcePath?: string; subpath?: string }) => React.createElement('div', null, 'Base preview'))
     mock.api.ui.FilePreview = preview
     initRuntime(mock.api)
-    render(<CanvasEditor relPath="Test.canvas" />)
+    render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
     await screen.findByText('Base preview')
     expect(preview.mock.calls[0][0]).toMatchObject({ relPath: 'Context.base', sourcePath: 'Test.canvas', subpath: '#Same date' })
   })
@@ -316,12 +321,18 @@ describe('CanvasEditor', () => {
     const root = container.querySelector('.canvas-root')!
     const hit = vi.fn(() => container.querySelector('[data-node-id="c"]'))
     Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: hit })
-    fireEvent.pointerDown(container.querySelector('.canvas-edge-hit')!, { button: 0 })
-    fireEvent.pointerDown(container.querySelector(`[data-edge-end="${end}"]`)!, { button: 0, pointerId: 3, clientX: 20, clientY: 20 })
+    // Dragging a connection moves its nearer end: press beside the end, then drag.
+    const path = container.querySelector('[data-edge-id="e1"] .canvas-interaction-path')!
+    const near = end === 'from' ? { clientX: 205, clientY: 50 } : { clientX: 395, clientY: 50 }
+    fireEvent.pointerDown(path, { button: 0, pointerId: 3, ...near })
+    fireEvent.pointerMove(root, { pointerId: 3, buttons: 1, clientX: 600, clientY: 30 })
     fireEvent.pointerUp(root, { pointerId: 3, clientX: 800, clientY: 20 })
     expect(canvasSession('Test.canvas')?.get().data.edges[0]).toMatchObject({ ...data.edges[0], [end + 'Node']: 'c', [end + 'Side']: 'left' })
     hit.mockReturnValue(null)
-    fireEvent.pointerDown(container.querySelector(`[data-edge-end="${end}"]`)!, { button: 0, pointerId: 4 })
+    const moved = canvasSession('Test.canvas')!.get().data.edges[0]
+    const again = end === 'from' ? { clientX: 805, clientY: 50 } : { clientX: 395, clientY: 50 }
+    fireEvent.pointerDown(container.querySelector(`[data-edge-id="${moved.id}"] .canvas-interaction-path`)!, { button: 0, pointerId: 4, ...again })
+    fireEvent.pointerMove(root, { pointerId: 4, buttons: 1, clientX: 900, clientY: 900 })
     fireEvent.pointerUp(root, { pointerId: 4, clientX: 1000, clientY: 1000 })
     expect(canvasSession('Test.canvas')?.get().data.edges).toHaveLength(2)
     await act(async () => { expect(await mock.undoActions.at(-1)!.undo()).toMatchObject({ ok: true }) })
@@ -329,7 +340,7 @@ describe('CanvasEditor', () => {
   })
 
   it('resolves a connection target in its own document when the editor is mounted in a frame', async () => {
-    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas({ nodes: wired.nodes, edges: [] }) } })
+    mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas({ nodes: wired.nodes, edges: [] }) } }))
     initRuntime(mock.api)
     const frame = document.createElement('iframe')
     document.body.append(frame)
@@ -337,7 +348,7 @@ describe('CanvasEditor', () => {
     Object.defineProperty(frame.contentWindow!, 'PointerEvent', { configurable: true, value: window.PointerEvent })
     const container = frameDocument.createElement('div')
     frameDocument.body.append(container)
-    const mounted = render(<CanvasEditor relPath="Test.canvas" />, { container, baseElement: frameDocument.body })
+    const mounted = render(<CanvasEditor relPath="Test.canvas" tab={TAB} />, { container, baseElement: frameDocument.body })
     const parentDescriptor = Object.getOwnPropertyDescriptor(document, 'elementFromPoint')
     const parentHit = vi.fn(() => null)
     Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: parentHit })
@@ -346,7 +357,7 @@ describe('CanvasEditor', () => {
       const target = container.querySelector('[data-node-id="b"]')!
       const frameHit = vi.fn(() => target)
       Object.defineProperty(frameDocument, 'elementFromPoint', { configurable: true, value: frameHit })
-      fireEvent.pointerDown(container.querySelector('[data-node-id="a"] .canvas-port.right')!, { button: 0, pointerId: 9 })
+      fireEvent.pointerDown(container.querySelector('[data-node-id="a"] .canvas-node-connection-point[data-side="right"]')!, { button: 0, pointerId: 9 })
       fireEvent.pointerUp(container.querySelector('.canvas-root')!, { pointerId: 9, clientX: 420, clientY: 20 })
       expect(canvasSession('Test.canvas')?.get().data.nodes).toHaveLength(2)
       expect(canvasSession('Test.canvas')?.get().data.edges).toEqual([expect.objectContaining({ fromNode: 'a', toNode: 'b' })])
@@ -366,7 +377,7 @@ describe('CanvasEditor', () => {
     await screen.findByText('Hello canvas')
     Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => null })
     await act(async () => {
-      fireEvent.pointerDown(container.querySelector('.canvas-port.right')!, { button: 0, pointerId: 5 })
+      fireEvent.pointerDown(container.querySelector('.canvas-node-connection-point[data-side="right"]')!, { button: 0, pointerId: 5 })
       fireEvent.pointerUp(container.querySelector('.canvas-root')!, { pointerId: 5, clientX: 800, clientY: 400 })
     })
     const data = canvasSession('Test.canvas')!.get().data
@@ -375,25 +386,30 @@ describe('CanvasEditor', () => {
     expect(mock.undoActions).toHaveLength(1)
   })
 
-  it('embeds HTTP pages in an isolated guest and ignores executable URLs', async () => {
-    const { container, unmount } = mountWith({ 'Test.canvas': serializeCanvas({ nodes: [
-      { id: 'web', type: 'link', url: 'https://obsidian.md/canvas', x: 0, y: 0, width: 400, height: 300 },
-      { id: 'invalid', type: 'link', url: 'javascript:alert(1)', x: 500, y: 0, width: 400, height: 300 }
-    ], edges: [] }) })
-    await waitFor(() => expect(container.querySelectorAll('webview')).toHaveLength(1))
-    const guest = container.querySelector('webview')!
-    expect(guest.getAttribute('partition')).toBe('web-incognito')
-    expect(guest.getAttribute('src')).toBe('https://obsidian.md/canvas')
-    unmount()
-    expect(guest.isConnected).toBe(false)
+  it('embeds HTTP pages in the host browser guest and never loads executable URLs', async () => {
+    mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas({ nodes: [
+      { id: 'web', type: 'link', url: 'https://example.org/wetland', x: 0, y: 0, width: 400, height: 300 },
+      { id: 'invalid', type: 'link', url: 'javascript:alert(1)', x: 500, y: 0, width: 400, height: 300 },
+      { id: 'empty', type: 'link', url: '', x: 1000, y: 0, width: 400, height: 300 }
+    ], edges: [] }) } }))
+    const guest = vi.fn((props: { src: string; partition?: string; instanceId: string }) => React.createElement('div', { 'data-testid': 'guest' }, props.src))
+    ;(mock.api.ui as unknown as { BrowserGuest: unknown }).BrowserGuest = guest
+    initRuntime(mock.api)
+    render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
+    await waitFor(() => expect(screen.getAllByTestId('guest')).toHaveLength(1))
+    expect(guest.mock.calls.at(-1)![0]).toMatchObject({ src: 'https://example.org/wetland', instanceId: 'canvas-link-web' })
+    expect(screen.getByText('javascript:alert(1)')).toBeTruthy()
+    // An empty web card waits for an explicit edit instead of taking focus when the board opens.
+    expect(screen.getByText('No web address')).toBeTruthy()
+    expect(document.querySelector('input')).toBeNull()
   })
 
   it('renders note cards through the host Markdown view with their own file context', async () => {
-    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas({ nodes: [{ id: 'note', type: 'file', file: 'Review.md', x: 0, y: 0, width: 400, height: 300 }], edges: [] }), 'Review.md': '# Review\nEmbedded content' } })
+    mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas({ nodes: [{ id: 'note', type: 'file', file: 'Review.md', x: 0, y: 0, width: 400, height: 300 }], edges: [] }), 'Review.md': '# Review\nEmbedded content' } }))
     const view = vi.fn((props: { value: string; context: { sourcePath?: string } }) => React.createElement('div', null, props.value))
     mock.api.ui.MarkdownView = view
     initRuntime(mock.api)
-    render(<CanvasEditor relPath="Test.canvas" />)
+    render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
     await screen.findByText(/Embedded content/)
     expect(view.mock.calls.at(-1)![0]).toMatchObject({ value: '# Review\nEmbedded content', context: { sourcePath: 'Review.md' } })
   })
@@ -405,7 +421,7 @@ describe('CanvasEditor', () => {
       const textarea = await screen.findByDisplayValue(previous)
       await act(async () => {
         fireEvent.change(textarea, { target: { value: next } })
-        fireEvent.blur(textarea)
+        fireEvent.keyDown(textarea, { key: 'Escape' })
       })
       expect(await screen.findByText(next)).toBeTruthy()
     }
@@ -433,7 +449,7 @@ describe('CanvasEditor', () => {
     fireEvent.doubleClick(await screen.findByText('Hello canvas'))
     const textarea = await screen.findByDisplayValue('Hello canvas')
     fireEvent.change(textarea, { target: { value: 'Retained scene' } })
-    fireEvent.blur(textarea)
+    fireEvent.keyDown(textarea, { key: 'Escape' })
     vi.mocked(mock.api.vault.writeFileGuarded).mockResolvedValueOnce({ ok: false, reason: 'conflict', current: null })
     await act(async () => { await expect(mock.runBeforeUnload()).rejects.toThrow('changed on disk') })
     expect(canvasDraft('Test.canvas')?.data.nodes[0]).toMatchObject({ text: 'Retained scene' })
@@ -451,12 +467,12 @@ describe('CanvasEditor', () => {
     await screen.findByText('Node A')
 
     // Every edge draws a visible line with a real path.
-    const lines = container.querySelectorAll('path.canvas-edge-line')
+    const lines = container.querySelectorAll('path.canvas-display-path')
     expect(lines).toHaveLength(3)
     lines.forEach((line) => expect(line.getAttribute('d')).toBeTruthy())
 
     // Arrowheads: default(1) + double(2) + none(0) = 3 — direction is honored.
-    expect(container.querySelectorAll('polygon.canvas-arrow')).toHaveLength(3)
+    expect(container.querySelectorAll('polygon.canvas-path-end')).toHaveLength(3)
 
     // The edge SVG is sized to the node bounds with a viewBox (not the old 0×0
     // box that culled every edge) — this is the invisible-edges bug fix.
@@ -474,7 +490,7 @@ describe('CanvasEditor', () => {
     const textarea = (await screen.findByDisplayValue('Hello canvas')) as HTMLTextAreaElement
 
     fireEvent.change(textarea, { target: { value: 'Updated text' } })
-    fireEvent.blur(textarea)
+    fireEvent.keyDown(textarea, { key: 'Escape' })
 
     // The debounced save writes parseable JSONCanvas with the new text.
     await waitFor(async () => {
@@ -492,7 +508,7 @@ describe('CanvasEditor', () => {
     expect(await screen.findByText('Agent edit')).toBeTruthy()
     expect(parseCanvas(await mock.api.vault.readFile('Test.canvas')).nodes[0]).toMatchObject({ text: 'Agent edit' })
     const menu = vi.spyOn(mock.api.ui, 'openMenu')
-    fireEvent.contextMenu(document.querySelector('.canvas-root')!)
+    fireEvent.click(screen.getByLabelText('Canvas settings'))
     const items = menu.mock.calls.at(-1)?.[0] ?? []
     const lock = items.find((item) => 'label' in item && item.label === 'Read-only')
     await act(async () => { if (lock && 'onSelect' in lock) await lock.onSelect?.() })
@@ -511,30 +527,47 @@ describe('CanvasEditor', () => {
     expect(mock.api.vault.writeFileGuarded).toHaveBeenCalledTimes(1)
   })
 
-  it('shows the empty hint and adds a card from the toolbar', async () => {
-    mountWith({ 'Test.canvas': '{ "nodes": [], "edges": [] }' })
-    expect(await screen.findByText(/Empty canvas/)).toBeTruthy()
-
-    fireEvent.click(screen.getByTitle('Add text card'))
-
-    // The hint is gone and the new card is in edit mode (an empty textbox).
-    await waitFor(() => expect(screen.queryByText(/Empty canvas/)).toBeNull())
+  it('adds a card from the create menu and edits it straight away', async () => {
+    const { container } = mountWith({ 'Test.canvas': '{ "nodes": [], "edges": [] }' })
+    await waitFor(() => expect(canvasSession('Test.canvas')?.get().ready).toBe(true))
+    fireEvent.click(screen.getByLabelText('Drag to add card'))
+    await waitFor(() => expect(container.querySelector('.canvas-node.is-editing')).toBeTruthy())
     expect(screen.getByRole('textbox')).toBeTruthy()
+    expect(canvasSession('Test.canvas')?.get().data.nodes[0]).toMatchObject({ type: 'text', width: 250, height: 60 })
+  })
+
+  it('creates a text card where the empty board is double-clicked', async () => {
+    const { container } = mountWith({ 'Test.canvas': '{ "nodes": [], "edges": [] }' })
+    await waitFor(() => expect(canvasSession('Test.canvas')?.get().ready).toBe(true))
+    fireEvent.doubleClick(container.querySelector('.canvas-root')!, { clientX: 300, clientY: 200 })
+    await waitFor(() => expect(canvasSession('Test.canvas')?.get().data.nodes).toHaveLength(1))
+    expect(canvasSession('Test.canvas')!.get().data.nodes[0]).toMatchObject({ type: 'text', x: 175, y: 170 })
+  })
+
+  it('keeps an invalid file read-only and never writes it', async () => {
+    const { container } = mountWith({ 'Test.canvas': '{ "nodes": [ broken' })
+    await screen.findByRole('alert')
+    expect(container.querySelector('.canvas-root')).toHaveClass('is-readonly')
+    fireEvent.doubleClick(container.querySelector('.canvas-root')!, { clientX: 300, clientY: 200 })
+    await expect(editCanvasTarget(mock.api, 'Test.canvas', { type: 'delete-nodes', ids: ['a'] })).rejects.toThrow()
+    await act(async () => { await mock.runBeforeUnload() })
+    expect(mock.api.vault.writeFileGuarded).not.toHaveBeenCalled()
+    expect(await mock.api.vault.readFile('Test.canvas')).toBe('{ "nodes": [ broken')
   })
 })
 
 /**
- * The Obsidian-parity chrome. jsdom has no layout, so every assertion here is on
- * classes, attributes and what actually reaches the file — never on a measured
- * rect (AGENTS.md).
+ * The board chrome. jsdom has no layout, so every assertion here is on classes,
+ * attributes and what actually reaches the file — never on a measured rect
+ * (AGENTS.md).
  */
 describe('CanvasEditor chrome', () => {
   let mock: MockValleyApi
 
   function mountWith(files: Record<string, string>): ReturnType<typeof render> {
-    mock = createMockValleyApi({ manifest: { id: 'canvas' }, files })
+    mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files }))
     initRuntime(mock.api)
-    return render(<CanvasEditor relPath="Test.canvas" />)
+    return render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
   }
 
   const overlapping: CanvasData = {
@@ -556,15 +589,18 @@ describe('CanvasEditor chrome', () => {
   const nodeEl = (container: HTMLElement, id: string): HTMLElement =>
     container.querySelector(`[data-node-id="${id}"]`) as HTMLElement
 
-  it('puts the create menu and the controls where Obsidian puts them', async () => {
+  it('puts the create menu bottom centre and four control groups top right', async () => {
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
     await screen.findByText('Hello canvas')
-    // Create menu (bottom centre) carries all four card types, each draggable.
+    // Create menu (bottom centre): card, note, media, web page and group, each draggable.
     const cardMenu = container.querySelector('.canvas-card-menu') as HTMLElement
     expect(cardMenu).toBeTruthy()
-    expect(cardMenu.querySelectorAll('button.draggable')).toHaveLength(4)
-    // Controls (top right) are grouped, not one flat strip.
-    expect(container.querySelectorAll('.canvas-controls .canvas-control-group').length).toBeGreaterThan(1)
+    expect(cardMenu.querySelectorAll('button.mod-draggable')).toHaveLength(5)
+    // Controls: settings; zoom in, reset, fit, zoom out; undo, redo; help.
+    const groups = [...container.querySelectorAll('.canvas-controls .canvas-control-group')]
+    expect(groups.map((group) => group.querySelectorAll('button').length)).toEqual([1, 4, 2, 1])
+    // Chrome paints above host content, so host widgets leave room for it.
+    expect(cardMenu.hasAttribute('data-plugin-widget-occluder')).toBe(true)
     // The old toolbar/zoom-cluster classes are gone for good.
     expect(container.querySelector('.canvas-toolbar')).toBeNull()
     expect(container.querySelector('.canvas-zoom-cluster')).toBeNull()
@@ -574,7 +610,7 @@ describe('CanvasEditor chrome', () => {
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
     await screen.findByText('Hello canvas')
     const world = container.querySelector('.canvas-world') as HTMLElement
-    expect(world.style.getPropertyValue('--canvas-inv-zoom')).toBeTruthy()
+    expect(world.style.getPropertyValue('--zm')).toBe('1')
   })
 
   it('renders the card in its own container so the label can sit outside it', async () => {
@@ -596,10 +632,11 @@ describe('CanvasEditor chrome', () => {
     await screen.findByText('Under')
 
     await act(async () => fireEvent.pointerDown(nodeEl(container, 'under'), { button: 0 }))
-    await act(async () => fireEvent.click(screen.getByTitle('More options')))
+    await act(async () => fireEvent.contextMenu(nodeEl(container, 'under')))
 
     // `openMenu` is the host's shared presenter, so the mock records the items
     // rather than rendering them — drive the entry the way the presenter would.
+    await waitFor(() => expect(mock.menus.length).toBeGreaterThan(0))
     const items = mock.menus[mock.menus.length - 1]
     const bringToFront = items.find((i) => i.label === 'Bring to front')
     expect(bringToFront).toBeTruthy()
@@ -611,25 +648,21 @@ describe('CanvasEditor chrome', () => {
     })
   })
 
-  it('offers the colour picker through the host popover, with a custom swatch', async () => {
+  it('opens the colour swatches under the selection menu, with a custom swatch', async () => {
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
     await screen.findByText('Hello canvas')
 
     fireEvent.pointerDown(nodeEl(container, 'a'), { button: 0 })
-    fireEvent.click(screen.getByTitle(/color/i))
+    fireEvent.click(screen.getByLabelText('Set color'))
 
-    // No hand-rolled positioned div: the picker goes through api.ui.openPopover.
-    expect(container.querySelector('.canvas-color-popover')).toBeNull()
-    expect(mock.popovers).toHaveLength(1)
-
-    const { container: picker } = render(<>{mock.popovers[0].node}</>)
-    // Six presets + clear + the custom swatch.
-    expect(picker.querySelectorAll('.canvas-swatch')).toHaveLength(8)
-    expect(picker.querySelector('.canvas-swatch.custom input[type="color"]')).toBeTruthy()
+    const picker = container.querySelector('.canvas-menu .canvas-submenu') as HTMLElement
+    // No colour + six presets + the custom swatch.
+    expect(picker.querySelectorAll('.canvas-color-picker-item')).toHaveLength(8)
+    expect(picker.querySelector('.canvas-color-picker-custom input[type="color"]')).toBeTruthy()
 
     // Presets render as palette variables, never a frozen hex.
-    const preset = picker.querySelectorAll('.canvas-swatch:not(.none):not(.custom)')[0] as HTMLElement
-    expect(preset.style.background).toContain('--color-red')
+    const preset = picker.querySelectorAll('.canvas-color-picker-item:not(.is-none):not(.canvas-color-picker-custom)')[0] as HTMLElement
+    expect(preset.style.getPropertyValue('--canvas-color')).toContain('--color-red')
 
     fireEvent.click(preset)
     await waitFor(async () => {
@@ -641,11 +674,12 @@ describe('CanvasEditor chrome', () => {
   it('shows a selection menu over the selected card, and none with nothing selected', async () => {
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(oneCard) })
     await screen.findByText('Hello canvas')
-    expect(container.querySelector('.canvas-selection-menu')).toBeNull()
+    expect(container.querySelector('.canvas-menu')).toBeNull()
 
     fireEvent.pointerDown(nodeEl(container, 'a'), { button: 0 })
-    expect(container.querySelector('.canvas-selection-menu')).toBeTruthy()
-    expect(screen.getByTitle('Duplicate')).toBeTruthy()
+    const menu = container.querySelector('.canvas-menu') as HTMLElement
+    expect(menu).toBeTruthy()
+    expect([...menu.querySelectorAll('button')].map((button) => button.getAttribute('aria-label'))).toEqual(['Set color', 'Zoom to selection', 'Edit', 'Remove'])
   })
 
   it('duplicates the selection into the file with a fresh id', async () => {
@@ -653,7 +687,7 @@ describe('CanvasEditor chrome', () => {
     await screen.findByText('Hello canvas')
 
     fireEvent.pointerDown(nodeEl(container, 'a'), { button: 0 })
-    fireEvent.click(screen.getByTitle('Duplicate'))
+    fireEvent.keyDown(container.querySelector('.canvas-root')!, { key: 'd', ctrlKey: true })
 
     await waitFor(async () => {
       const data = parseCanvas(await mock.api.vault.readFile('Test.canvas'))
@@ -682,30 +716,31 @@ describe('CanvasEditor chrome', () => {
     })
   })
 
-  it('cycles an edge through all four arrow-end states', async () => {
+  it('sets an edge to no arrows, one way or both ways', async () => {
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(labelled) })
     await screen.findByText('Node A')
 
-    fireEvent.pointerDown(container.querySelector('path.canvas-edge-hit') as Element, { button: 0 })
+    fireEvent.pointerDown(container.querySelector('.canvas-interaction-path') as Element, { button: 0 })
+    fireEvent.pointerUp(container.querySelector('.canvas-root')!)
 
     // The edge starts at the spec defaults (from: none, to: arrow), written as
-    // neither key. Each click advances one step of EDGE_END_CYCLE, and a value
-    // equal to its spec default is omitted from the file rather than written.
+    // neither key; a value equal to its spec default is omitted from the file.
     const ends = async (): Promise<[unknown, unknown]> => {
       const e = parseCanvas(await mock.api.vault.readFile('Test.canvas')).edges[0]
       return [e.fromEnd, e.toEnd]
     }
+    const choose = async (id: string): Promise<void> => {
+      fireEvent.click(screen.getByLabelText('Line direction'))
+      await waitFor(() => expect(mock.menus.length).toBeGreaterThan(0))
+      const item = mock.menus[mock.menus.length - 1].find((entry) => entry.id === id)!
+      await act(async () => { await item.onSelect!() })
+    }
 
-    fireEvent.click(screen.getByTitle('Arrow ends'))
-    await waitFor(async () => expect(await ends()).toEqual(['arrow', 'none']))
-
-    fireEvent.click(screen.getByTitle('Arrow ends'))
+    await choose('both')
     await waitFor(async () => expect(await ends()).toEqual(['arrow', undefined]))
-
-    fireEvent.click(screen.getByTitle('Arrow ends'))
+    await choose('none')
     await waitFor(async () => expect(await ends()).toEqual([undefined, 'none']))
-
-    fireEvent.click(screen.getByTitle('Arrow ends'))
+    await choose('one')
     await waitFor(async () => expect(await ends()).toEqual([undefined, undefined]))
   })
 
@@ -728,9 +763,9 @@ describe('CanvasEditor chrome', () => {
     }
     const { container } = mountWith({ 'Test.canvas': serializeCanvas(withGroup) })
     await screen.findByText('Frame')
-    const bg = container.querySelector('.canvas-group-bg') as HTMLElement
+    const bg = container.querySelector('.canvas-group-background') as HTMLElement
     expect(bg).toBeTruthy()
-    expect(bg.className).toContain('ratio')
+    expect(bg.className).toContain('mod-ratio')
     // The asset URL percent-encodes the vault path, so match the encoded form.
     expect(bg.style.backgroundImage).toContain(encodeURIComponent('Images/braun.jpg'))
   })
@@ -772,13 +807,12 @@ describe('CanvasEditor chrome', () => {
       'Test.canvas': serializeCanvas(subCard),
       'Note.md': '# Note\n\nIntro.\n\n## Simplicity\n\nSay no.\n\n## Taste\n\nEdit.\n'
     })
-    // The mock's markdown.render is the identity, so assert on the card's text
-    // rather than on rendered elements.
+    // The Markdown view stand-in renders its value as text.
     await waitFor(() => {
-      const body = container.querySelector('.canvas-node-body') as HTMLElement
+      const body = container.querySelector('[data-testid="markdown-view"]') as HTMLElement
       expect(body?.textContent).toContain('Say no.')
     })
-    const body = container.querySelector('.canvas-node-body') as HTMLElement
+    const body = container.querySelector('[data-testid="markdown-view"]') as HTMLElement
     expect(body.textContent).toContain('## Simplicity')
     expect(body.textContent).not.toContain('Intro.')
     expect(body.textContent).not.toContain('Edit.')

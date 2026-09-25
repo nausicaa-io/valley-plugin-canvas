@@ -1,6 +1,12 @@
 {
   "icon": "layout-dashboard",
   "main": "runtime/index.js",
+  "drivers": [
+    "browser"
+  ],
+  "permissions": {
+    "browser": {}
+  },
   "fileViews": {
     ".canvas": {
       "view": "canvas.editor"

@@ -3,14 +3,15 @@
  * mutation helpers the editor builds on. Everything here is React-free and
  * unit-tested (`plugins/canvas/tests/model.test.ts`).
  *
- * The spec of record is `spec/1.0.md` in https://github.com/obsidianmd/jsoncanvas
+ * The spec of record is `spec/1.0.md` in the JSON Canvas repository (jsoncanvas.org)
  * (MIT) — the versioned file, not the website rendering, so a 1.1 shows up as a
- * diff. `tests/fixtures/jsoncanvas/sample.canvas` is that repo's own sample,
- * vendored verbatim and round-tripped by the test suite.
+ * diff. `tests/fixtures/sample.canvas` is that repo's own sample, vendored
+ * verbatim and round-tripped by the test suite.
  *
  * Tolerance mirrors the vault's JSONL invariant: a malformed `.canvas` never
- * throws — it degrades to an empty canvas — and unknown node/edge fields written
- * by other tools (e.g. Obsidian's `styleAttributes`) are preserved on round-trip.
+ * throws. Unparseable JSON is reported as invalid so the editor stays
+ * read-only instead of overwriting it, and every node, edge or top-level key
+ * the editor cannot use is kept verbatim so a save never drops another tool's data.
  */
 import { paletteCssContrast, paletteCssValue, paletteRef } from '@valley/plugin-sdk/palette'
 
@@ -23,7 +24,7 @@ export interface CanvasNodeBase {
   width: number
   height: number
   color?: CanvasColor
-  /** Preserve fields written by other tools (Obsidian, future spec additions). */
+  /** Preserve fields written by other tools and future spec additions. */
   [key: string]: unknown
 }
 export interface TextNode extends CanvasNodeBase {
@@ -70,9 +71,19 @@ export interface CanvasEdge {
   [key: string]: unknown
 }
 
+/** An array entry the editor cannot use, kept verbatim at its original position. */
+export interface PreservedEntry {
+  index: number
+  raw: unknown
+}
+
 export interface CanvasData {
   nodes: CanvasNode[]
   edges: CanvasEdge[]
+  /** Unknown top-level keys, written back after `nodes` and `edges`. */
+  extra?: Record<string, unknown>
+  /** Entries that could not be read as nodes/edges (no id, duplicate id, unknown type). */
+  preserved?: { nodes: PreservedEntry[]; edges: PreservedEntry[] }
 }
 
 /**
@@ -81,10 +92,9 @@ export interface CanvasData {
  * The spec deliberately leaves the values open — "Specific values for the preset
  * colors are intentionally not defined so that applications can tailor the
  * presets to their specific brand colors or color scheme" — so `"1".."6"` stays
- * the on-disk form (that is the Obsidian interop contract) while the rendered
+ * the on-disk form (the interchange contract) while the rendered
  * colour comes from `src/shared/palette.ts` and follows light/dark plus
- * any `.valley/design/*.css` override. Valley's palette names the last one
- * `violet`; the spec calls it purple.
+ * any `.valley/design/*.css` override.
  */
 export const CANVAS_PRESET_PALETTE: Record<string, string> = {
   '1': 'red',
@@ -92,7 +102,7 @@ export const CANVAS_PRESET_PALETTE: Record<string, string> = {
   '3': 'yellow',
   '4': 'green',
   '5': 'cyan',
-  '6': 'violet'
+  '6': 'purple'
 }
 
 /**
@@ -111,7 +121,7 @@ export function resolveColor(color: CanvasColor | undefined): string | null {
 
 /**
  * The readable foreground for text sitting ON a filled {@link resolveColor} —
- * a group's label plate, which Obsidian fills solid once the group is themed.
+ * a group's label plate, which is filled solid once the group is themed.
  * Null when the colour is unset or unknown; a custom hex falls back to the app's
  * title colour, because we cannot know a user literal's luminance without
  * freezing a computed value.
@@ -124,7 +134,7 @@ export function resolveContrast(color: CanvasColor | undefined): string | null {
 }
 
 export const DEFAULT_TEXT_WIDTH = 250
-export const DEFAULT_TEXT_HEIGHT = 120
+export const DEFAULT_TEXT_HEIGHT = 60
 export const DEFAULT_FILE_WIDTH = 400
 export const DEFAULT_FILE_HEIGHT = 400
 export const DEFAULT_LINK_WIDTH = 400
@@ -148,7 +158,7 @@ function str(v: unknown): string {
   return typeof v === 'string' ? v : ''
 }
 
-/** 16 lowercase hex chars, matching Obsidian's node/edge id shape. */
+/** 16 lowercase hex chars, the usual JSON Canvas node/edge id shape. */
 export function genId(): string {
   const bytes = new Uint8Array(8)
   const cryptoObj = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined
@@ -163,11 +173,13 @@ export function genId(): string {
 }
 
 function coerceNode(raw: unknown): CanvasNode | null {
-  if (!raw || typeof raw !== 'object') return null
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const o = raw as Record<string, unknown>
-  const id = typeof o.id === 'string' ? o.id : null
+  const id = typeof o.id === 'string' && o.id ? o.id : null
   const type = o.type as CanvasNodeType
   if (!id || !NODE_TYPES.includes(type)) return null
+  // Every other key — including values this editor does not understand, such as
+  // a subpath without `#` or an unknown background style — is kept as written.
   const base = {
     ...o,
     id,
@@ -178,77 +190,114 @@ function coerceNode(raw: unknown): CanvasNode | null {
     height: num(o.height, DEFAULT_TEXT_HEIGHT)
   }
   if (type === 'text') return { ...base, text: str(o.text) } as TextNode
-  if (type === 'file') {
-    // `subpath` is optional and must start with `#`; anything else is not a
-    // subpath, so it is not read as one — the raw key still round-trips.
-    const subpath = typeof o.subpath === 'string' && o.subpath.startsWith('#') ? o.subpath : undefined
-    return { ...base, file: str(o.file), subpath } as FileNode
-  }
+  if (type === 'file') return { ...base, file: str(o.file) } as FileNode
   if (type === 'link') return { ...base, url: str(o.url) } as LinkNode
-  const backgroundStyle = GROUP_BACKGROUND_STYLES.includes(o.backgroundStyle as GroupBackgroundStyle)
-    ? (o.backgroundStyle as GroupBackgroundStyle)
-    : undefined
-  return {
-    ...base,
-    label: str(o.label),
-    background: typeof o.background === 'string' && o.background ? o.background : undefined,
-    backgroundStyle
-  } as GroupNode
+  return base as GroupNode
 }
 
 function coerceEdge(raw: unknown): CanvasEdge | null {
-  if (!raw || typeof raw !== 'object') return null
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const o = raw as Record<string, unknown>
-  const id = typeof o.id === 'string' ? o.id : null
+  const id = typeof o.id === 'string' && o.id ? o.id : null
   const fromNode = typeof o.fromNode === 'string' ? o.fromNode : null
   const toNode = typeof o.toNode === 'string' ? o.toNode : null
   if (!id || !fromNode || !toNode) return null
-  // A side or end outside its enum is dropped rather than carried: the renderer
-  // would otherwise anchor the curve to a side that does not exist. Undefined is
-  // exactly what the spec says to do — fall back to the derived side.
-  return {
-    ...o,
-    id,
-    fromNode,
-    toNode,
-    fromSide: edgeSide(o.fromSide),
-    toSide: edgeSide(o.toSide),
-    fromEnd: edgeEnd(o.fromEnd),
-    toEnd: edgeEnd(o.toEnd)
-  } as CanvasEdge
+  return { ...o, id, fromNode, toNode } as CanvasEdge
 }
 
-/** Parse `.canvas` text into a model. Never throws — malformed → empty canvas. */
-export function parseCanvas(text: string): CanvasData {
-  if (!text || !text.trim()) return { nodes: [], edges: [] }
+/** A side the renderer can anchor to; anything else falls back to the derived side. */
+export function validSide(side: unknown): EdgeSide | undefined {
+  return edgeSide(side)
+}
+/** An end the renderer can draw; anything else uses the spec default. */
+export function validEnd(end: unknown): EdgeEnd | undefined {
+  return edgeEnd(end)
+}
+/** The subpath of a file node, when it is one (`#Heading` or `#^block`). */
+export function fileSubpath(node: FileNode): string | undefined {
+  return typeof node.subpath === 'string' && node.subpath.startsWith('#') ? node.subpath : undefined
+}
+/** The background image of a group, and how it paints. */
+export function groupBackground(node: GroupNode): { file: string; style: GroupBackgroundStyle } | null {
+  if (typeof node.background !== 'string' || !node.background) return null
+  const style = GROUP_BACKGROUND_STYLES.includes(node.backgroundStyle as GroupBackgroundStyle) ? node.backgroundStyle as GroupBackgroundStyle : 'cover'
+  return { file: node.background, style }
+}
+
+export interface ParsedCanvas {
+  data: CanvasData
+  /** False when the text is not a JSON Canvas document at all; the file must not be overwritten. */
+  valid: boolean
+}
+
+/** Parse `.canvas` text. Never throws; entries the editor cannot use are preserved verbatim. */
+export function parseCanvasDocument(text: string): ParsedCanvas {
+  if (!text || !text.trim()) return { data: { nodes: [], edges: [] }, valid: true }
   let raw: unknown
   try {
     raw = JSON.parse(text)
   } catch {
-    return { nodes: [], edges: [] }
+    return { data: { nodes: [], edges: [] }, valid: false }
   }
-  if (!raw || typeof raw !== 'object') return { nodes: [], edges: [] }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { data: { nodes: [], edges: [] }, valid: false }
   const obj = raw as Record<string, unknown>
-  const nodes = Array.isArray(obj.nodes)
-    ? obj.nodes.map(coerceNode).filter((n): n is CanvasNode => n !== null)
-    : []
-  const edges = Array.isArray(obj.edges)
-    ? obj.edges.map(coerceEdge).filter((e): e is CanvasEdge => e !== null)
-    : []
-  return { nodes, edges }
+  if ((obj.nodes !== undefined && !Array.isArray(obj.nodes)) || (obj.edges !== undefined && !Array.isArray(obj.edges))) return { data: { nodes: [], edges: [] }, valid: false }
+  const preserved: { nodes: PreservedEntry[]; edges: PreservedEntry[] } = { nodes: [], edges: [] }
+  const nodes: CanvasNode[] = []
+  const nodeIds = new Set<string>()
+  ;(obj.nodes as unknown[] | undefined ?? []).forEach((entry, index) => {
+    const node = coerceNode(entry)
+    if (node && !nodeIds.has(node.id)) { nodeIds.add(node.id); nodes.push(node) } else preserved.nodes.push({ index, raw: entry })
+  })
+  const edges: CanvasEdge[] = []
+  const edgeIds = new Set<string>()
+  ;(obj.edges as unknown[] | undefined ?? []).forEach((entry, index) => {
+    const edge = coerceEdge(entry)
+    if (edge && !edgeIds.has(edge.id)) { edgeIds.add(edge.id); edges.push(edge) } else preserved.edges.push({ index, raw: entry })
+  })
+  const extra: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(obj)) if (key !== 'nodes' && key !== 'edges') extra[key] = value
+  const data: CanvasData = { nodes, edges }
+  if (Object.keys(extra).length) data.extra = extra
+  if (preserved.nodes.length || preserved.edges.length) data.preserved = preserved
+  return { data, valid: true }
+}
+
+/** Parse `.canvas` text into a model. Never throws — malformed → empty canvas. */
+export function parseCanvas(text: string): CanvasData {
+  return parseCanvasDocument(text).data
+}
+
+function withPreserved(items: readonly unknown[], preserved: readonly PreservedEntry[] | undefined): unknown[] {
+  if (!preserved?.length) return [...items]
+  const out = [...items]
+  for (const entry of preserved) out.splice(Math.min(entry.index, out.length), 0, entry.raw)
+  return out
+}
+
+function serializeList(key: string, items: readonly unknown[]): string {
+  if (!items.length) return `\t${JSON.stringify(key)}:[]`
+  return `\t${JSON.stringify(key)}:[\n${items.map((item) => `\t\t${JSON.stringify(item)}`).join(',\n')}\n\t]`
 }
 
 /**
- * Serialize to pretty 2-space JSON (clean diffs), with a trailing newline.
+ * Serialize in the common JSON Canvas layout: tab-indented, one entry per line,
+ * no trailing newline — so a board saved here diffs cleanly against one saved
+ * by another JSON Canvas editor.
  *
  * Node order IS z-order (spec: "Nodes are placed in the array in ascending order
  * by z-index"), so the array is written exactly as held — never sorted.
  */
 export function serializeCanvas(data: CanvasData): string {
-  return `${JSON.stringify({ nodes: data.nodes, edges: data.edges }, null, 2)}\n`
+  const parts = [
+    serializeList('nodes', withPreserved(data.nodes, data.preserved?.nodes)),
+    serializeList('edges', withPreserved(data.edges, data.preserved?.edges))
+  ]
+  for (const [key, value] of Object.entries(data.extra ?? {})) parts.push(`\t${JSON.stringify(key)}:${JSON.stringify(value)}`)
+  return `{\n${parts.join(',\n')}\n}`
 }
 
-export const EMPTY_CANVAS = '{\n  "nodes": [],\n  "edges": []\n}\n'
+export const EMPTY_CANVAS = serializeCanvas({ nodes: [], edges: [] })
 
 /**
  * The slice of `markdown` a file node's `subpath` points at.
@@ -301,17 +350,17 @@ export function sliceSubpath(markdown: string, subpath: string | undefined): str
 
 // ── Node factories ──────────────────────────────────────────────────────────
 
-export function createTextNode(x: number, y: number, text = ''): TextNode {
-  return { id: genId(), type: 'text', text, x, y, width: DEFAULT_TEXT_WIDTH, height: DEFAULT_TEXT_HEIGHT }
+export function createTextNode(x: number, y: number, text = '', width = DEFAULT_TEXT_WIDTH, height = DEFAULT_TEXT_HEIGHT): TextNode {
+  return { id: genId(), type: 'text', x, y, width, height, text }
 }
-export function createFileNode(x: number, y: number, file: string): FileNode {
-  return { id: genId(), type: 'file', file, x, y, width: DEFAULT_FILE_WIDTH, height: DEFAULT_FILE_HEIGHT }
+export function createFileNode(x: number, y: number, file: string, width = DEFAULT_FILE_WIDTH, height = DEFAULT_FILE_HEIGHT, subpath?: string): FileNode {
+  return { id: genId(), type: 'file', x, y, width, height, file, ...(subpath ? { subpath } : {}) }
 }
-export function createLinkNode(x: number, y: number, url: string): LinkNode {
-  return { id: genId(), type: 'link', url, x, y, width: DEFAULT_LINK_WIDTH, height: DEFAULT_LINK_HEIGHT }
+export function createLinkNode(x: number, y: number, url: string, width = DEFAULT_LINK_WIDTH, height = DEFAULT_LINK_HEIGHT): LinkNode {
+  return { id: genId(), type: 'link', x, y, width, height, url }
 }
-export function createGroupNode(x: number, y: number, width: number, height: number, label = 'Group'): GroupNode {
-  return { id: genId(), type: 'group', label, x, y, width, height }
+export function createGroupNode(x: number, y: number, width: number, height: number, label?: string): GroupNode {
+  return { id: genId(), type: 'group', x, y, width, height, ...(label ? { label } : {}) }
 }
 
 // ── Immutable mutation helpers ──────────────────────────────────────────────
@@ -332,6 +381,7 @@ export function addEdge(data: CanvasData, edge: CanvasEdge): CanvasData {
 export function removeNodes(data: CanvasData, ids: ReadonlySet<string>): CanvasData {
   if (ids.size === 0) return data
   return {
+    ...data,
     nodes: data.nodes.filter((n) => !ids.has(n.id)),
     edges: data.edges.filter((e) => !ids.has(e.fromNode) && !ids.has(e.toNode))
   }
@@ -449,7 +499,7 @@ export function setEdgeLabel(data: CanvasData, id: string, label: string): Canva
 /**
  * Set an edge's arrowheads. The spec's defaults are `fromEnd: 'none'` and
  * `toEnd: 'arrow'`, so those two are written out only when they differ — a
- * plain one-way arrow stays the minimal `{}` Obsidian writes.
+ * plain one-way arrow stays minimal.
  */
 export function setEdgeEnds(data: CanvasData, id: string, fromEnd: EdgeEnd, toEnd: EdgeEnd): CanvasData {
   return patchEdge(data, id, (next) => {

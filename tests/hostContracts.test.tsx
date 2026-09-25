@@ -111,3 +111,17 @@ it('keeps package styles tokenized, scalable, and consistent with SDK drop marke
     }
   }
 })
+
+describe('package naming', () => {
+  // The vendored spec sample is third-party data and stays byte-identical.
+  const scanned = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = joinStylePath(dir, entry.name)
+    return entry.isDirectory() ? scanned(path) : path.endsWith('sample.canvas') ? [] : [path]
+  })
+  it('never names another application in its source, tests, catalogs or package files', () => {
+    const root = joinStylePath(__dirname, '..')
+    const files = [...scanned(joinStylePath(root, 'src')), ...scanned(joinStylePath(root, 'tests')), ...scanned(joinStylePath(root, 'locales')), ...['manifest.json', 'config.json', 'README.md', 'package.json'].map((file) => joinStylePath(root, file))]
+    const reference = ['obs', 'idian'].join('')
+    expect(files.filter((file) => readStyleFile(file, 'utf8').toLowerCase().includes(reference))).toEqual([])
+  })
+})

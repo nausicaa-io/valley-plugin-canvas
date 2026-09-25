@@ -4,29 +4,33 @@ import {
   type CanvasEdge,
   type CanvasNode,
   type EdgeSide,
-  resolveColor
+  resolveColor,
+  validEnd,
+  validSide
 } from './canvasModel'
 import {
-  arrowPoints,
-  bezierMidpoint,
+  ARROW_LENGTH,
+  arrowHead,
   bezierPath,
   boundsOf,
   chooseSide,
+  edgePath,
   nodeRect,
   sideAnchor,
   type Point
 } from './geometry'
 
-const ARROW_SIZE = 10
 // Padding around the node bounds so the SVG box comfortably contains bezier
 // control-point bows + arrowheads (the curve can bow out by up to ~400px).
 const SVG_PAD = 500
+/** Edge labels sit above unselected cards (their z-index band), so host content leaves room for them. */
+const LABEL_LAYER = 50000
 
 function opposite(side: EdgeSide): EdgeSide {
   return side === 'top' ? 'bottom' : side === 'bottom' ? 'top' : side === 'left' ? 'right' : 'left'
 }
 
-interface EdgeGeom {
+export interface EdgeGeom {
   edge: CanvasEdge
   path: string
   from: Point
@@ -35,27 +39,33 @@ interface EdgeGeom {
   toSide: EdgeSide
   mid: Point
   color: string | null
+  fromArrow: boolean
+  toArrow: boolean
 }
 
-function geomFor(edge: CanvasEdge, nodes: Map<string, CanvasNode>): EdgeGeom | null {
+/** Where an edge runs, or null when either end is not on the board. */
+export function edgeGeometry(edge: CanvasEdge, nodes: Map<string, CanvasNode>, zm: number): EdgeGeom | null {
   const a = nodes.get(edge.fromNode)
   const b = nodes.get(edge.toNode)
   if (!a || !b) return null
   const ra = nodeRect(a)
   const rb = nodeRect(b)
-  const fromSide = edge.fromSide ?? chooseSide(ra, rb)
-  const toSide = edge.toSide ?? chooseSide(rb, ra)
+  const fromSide = validSide(edge.fromSide) ?? chooseSide(ra, rb)
+  const toSide = validSide(edge.toSide) ?? chooseSide(rb, ra)
   const from = sideAnchor(ra, fromSide)
   const to = sideAnchor(rb, toSide)
+  const drawn = edgePath(from, fromSide, to, toSide, ARROW_LENGTH * zm)
   return {
     edge,
-    path: bezierPath(from, fromSide, to, toSide),
+    path: drawn.path,
     from,
     fromSide,
     to,
     toSide,
-    mid: bezierMidpoint(from, fromSide, to, toSide),
-    color: resolveColor(edge.color)
+    mid: drawn.mid,
+    color: resolveColor(edge.color),
+    fromArrow: (validEnd(edge.fromEnd) ?? 'none') === 'arrow',
+    toArrow: (validEnd(edge.toEnd) ?? 'arrow') === 'arrow'
   }
 }
 
@@ -71,14 +81,14 @@ export interface EdgeLayerProps {
   selectedEdge: string | null
   /** Id of the edge whose label is being edited inline, if any. */
   editingLabel: string | null
-  /** Counteracts the world transform so chrome holds its on-screen size. */
-  invZoom: number
-  onSelectEdge: (id: string, additive: boolean) => void
+  /** The zoom multiplier: chrome inside the board keeps part of its screen size. */
+  zm: number
+  connecting: boolean
+  onEdgePointerDown: (event: React.PointerEvent, edge: CanvasEdge) => void
   onStartLabelEdit: (id: string) => void
   onCommitLabel: (id: string, label: string) => void
   onCancelLabel: () => void
   preview: ConnectPreview | null
-  onReconnect?: (event: React.PointerEvent, edge: CanvasEdge, end: 'from' | 'to') => void
 }
 
 /**
@@ -87,13 +97,11 @@ export interface EdgeLayerProps {
  *
  * Two sub-layers: one SVG for the curves, arrowheads and fat transparent hit
  * paths, and a DOM layer above it for labels. Labels are DOM rather than SVG
- * `<text>` (which is what Obsidian does too) because they need an opaque plate
- * to stay readable over a card, and an inline editor on double-click. Stroke
- * widths live in CSS so they can multiply by `--canvas-chrome`; the arrowhead is
- * built in JS, so it takes `invZoom` directly.
+ * `<text>` because they need an opaque plate to stay readable over a card, and
+ * an inline editor on double-click.
  */
 export const EdgeLayer = (props: EdgeLayerProps): ReturnType<typeof React.createElement> => {
-  const { data, nodesById, selectedEdge, editingLabel, invZoom, onSelectEdge, preview } = props
+  const { data, nodesById, selectedEdge, editingLabel, zm, preview } = props
   // Size the SVG to the node bounds (+ padding) and give it a matching viewBox so
   // its user space is identical to world space — a 0×0 SVG does not paint its
   // overflow in Chromium, so edges drawn at world coords were being culled.
@@ -103,16 +111,15 @@ export const EdgeLayer = (props: EdgeLayerProps): ReturnType<typeof React.create
   const minY = bounds.y - SVG_PAD
   const w = bounds.width + SVG_PAD * 2
   const h = bounds.height + SVG_PAD * 2
-  const arrow = ARROW_SIZE * invZoom
 
   const geoms = data.edges
-    .map((edge) => geomFor(edge, nodesById))
+    .map((edge) => edgeGeometry(edge, nodesById, zm))
     .filter((g): g is EdgeGeom => g !== null)
 
   return (
     <>
       <svg
-        className="canvas-edges"
+        className={`canvas-edges${props.connecting ? ' is-connecting' : ''}`}
         style={{ left: minX, top: minY, width: w, height: h }}
         width={w}
         height={h}
@@ -120,36 +127,13 @@ export const EdgeLayer = (props: EdgeLayerProps): ReturnType<typeof React.create
       >
         {geoms.map((g) => {
           const edge = g.edge
-          const selected = selectedEdge === edge.id
-          const style = g.color ? ({ ['--canvas-edge-color' as string]: g.color } as React.CSSProperties) : undefined
-          const toEnd = edge.toEnd ?? 'arrow'
-          const fromEnd = edge.fromEnd ?? 'none'
+          const style = g.color ? ({ ['--canvas-color' as string]: g.color } as React.CSSProperties) : undefined
           return (
-            <g key={edge.id} className={`canvas-edge${selected ? ' selected' : ''}`} style={style}>
-              <path
-                className="canvas-edge-hit"
-                d={g.path}
-                onPointerDown={(e) => {
-                  e.stopPropagation()
-                  onSelectEdge(edge.id, e.shiftKey)
-                }}
-              />
-              <path className="canvas-edge-line" d={g.path} />
-              {toEnd === 'arrow' && <polygon className="canvas-arrow" points={arrowPoints(g.to, g.toSide, arrow)} />}
-              {fromEnd === 'arrow' && (
-                <polygon className="canvas-arrow" points={arrowPoints(g.from, g.fromSide, arrow)} />
-              )}
-              {selected && props.onReconnect && (['from', 'to'] as const).map((end) => (
-                <circle
-                  key={end}
-                  className="canvas-edge-endpoint"
-                  data-edge-end={end}
-                  cx={g[end].x}
-                  cy={g[end].y}
-                  r={7 * invZoom}
-                  onPointerDown={(event) => props.onReconnect?.(event, edge, end)}
-                />
-              ))}
+            <g key={edge.id} className={`canvas-edge${selectedEdge === edge.id ? ' is-focused' : ''}${g.color ? ' is-themed' : ''}`} style={style} data-edge-id={edge.id}>
+              <path className="canvas-display-path" d={g.path} />
+              <path className="canvas-interaction-path" d={g.path} onPointerDown={(e) => props.onEdgePointerDown(e, edge)} />
+              {g.toArrow && <polygon className="canvas-path-end" points={arrowHead(g.to, g.toSide, zm)} />}
+              {g.fromArrow && <polygon className="canvas-path-end" points={arrowHead(g.from, g.fromSide, zm)} />}
             </g>
           )
         })}
@@ -165,31 +149,30 @@ export const EdgeLayer = (props: EdgeLayerProps): ReturnType<typeof React.create
         {geoms.map((g) => {
           const editing = editingLabel === g.edge.id
           if (!g.edge.label && !editing) return null
+          const style = { left: g.mid.x, top: g.mid.y, ...(g.color ? { ['--canvas-color' as string]: g.color } : {}) } as React.CSSProperties
           return (
             <div
               key={g.edge.id}
-              className={`canvas-path-label-wrapper canvas-edge${selectedEdge === g.edge.id ? ' selected' : ''}`}
-              style={{ left: g.mid.x, top: g.mid.y }}
+              className={`canvas-path-label-wrapper${selectedEdge === g.edge.id ? ' is-focused' : ''}`}
+              style={style}
             >
               {editing ? (
                 <EdgeLabelInput
-                  initial={g.edge.label ?? ''}
+                  initial={typeof g.edge.label === 'string' ? g.edge.label : ''}
                   onCommit={(value) => props.onCommitLabel(g.edge.id, value)}
                   onCancel={props.onCancelLabel}
                 />
               ) : (
                 <div
                   className="canvas-path-label"
-                  onPointerDown={(e) => {
-                    e.stopPropagation()
-                    onSelectEdge(g.edge.id, e.shiftKey)
-                  }}
+                  data-plugin-widget-occluder={LABEL_LAYER}
+                  onPointerDown={(e) => props.onEdgePointerDown(e, g.edge)}
                   onDoubleClick={(e) => {
                     e.stopPropagation()
                     props.onStartLabelEdit(g.edge.id)
                   }}
                 >
-                  {g.edge.label}
+                  {String(g.edge.label)}
                 </div>
               )}
             </div>
@@ -206,20 +189,29 @@ const EdgeLabelInput = (props: {
   onCancel: () => void
 }): ReturnType<typeof React.createElement> => {
   const [value, setValue] = React.useState(props.initial)
+  const done = React.useRef(false)
+  const commit = (): void => {
+    if (done.current) return
+    done.current = true
+    props.onCommit(value)
+  }
   return (
-    <input
-      className="canvas-path-label canvas-path-label-input"
+    <textarea
+      className="canvas-path-label is-editing"
+      data-plugin-widget-occluder={LABEL_LAYER}
       autoFocus
+      rows={Math.max(1, value.split('\n').length)}
       value={value}
       onPointerDown={(e) => e.stopPropagation()}
       onChange={(e) => setValue(e.target.value)}
-      onBlur={() => props.onCommit(value)}
+      onBlur={commit}
       onKeyDown={(e) => {
-        if (e.key === 'Enter') {
+        if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault()
-          props.onCommit(value)
+          commit()
         } else if (e.key === 'Escape') {
           e.preventDefault()
+          done.current = true
           props.onCancel()
         }
       }}

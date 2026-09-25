@@ -1,6 +1,6 @@
 import { guardedCreatedFileRevert, type ValleyPluginApi } from '@valley/plugin-sdk'
 import type { FileBaseline } from '@valley/plugin-sdk/types'
-import { EMPTY_CANVAS, addNode, addEdge, createTextNode, createFileNode, createLinkNode, createGroupNode, duplicateNodes, removeNodes, removeEdges, reorderNodes, updateNode, parseCanvas, serializeCanvas, type CanvasData, type CanvasNode, type CanvasEdge } from './canvasModel'
+import { EMPTY_CANVAS, addNode, addEdge, createTextNode, createFileNode, createLinkNode, createGroupNode, duplicateNodes, genId, removeNodes, removeEdges, reorderNodes, updateNode, parseCanvasDocument, serializeCanvas, type CanvasData, type CanvasNode, type CanvasEdge } from './canvasModel'
 import { isAllowedExternalUrl, normalizeRelPathOpt } from '@valley/plugin-sdk/paths'
 import { canvasDraft, canvasSession } from './session'
 import { captureCanvasOwner, type CanvasOwner } from './runtime'
@@ -124,7 +124,7 @@ export function applyCanvasOperation(data: CanvasData, raw: unknown): CanvasData
       const { id: requestedId, type: _kind, ...rawValues } = node
       const values = checkFields(rawValues, fieldsForNode(kind))
       if (typeof values.x !== 'number' || typeof values.y !== 'number') throw new Error('Expected card coordinates.')
-      const created = kind === 'text' ? createTextNode(values.x, values.y, typeof values.text === 'string' ? values.text : '') : kind === 'file' ? createFileNode(values.x, values.y, requiredString(values.file)) : kind === 'link' ? createLinkNode(values.x, values.y, requiredString(values.url)) : kind === 'group' ? createGroupNode(values.x, values.y, Number(values.width ?? 400), Number(values.height ?? 300), String(values.label ?? '')) : null
+      const created = kind === 'text' ? createTextNode(values.x, values.y, typeof values.text === 'string' ? values.text : '') : kind === 'file' ? createFileNode(values.x, values.y, requiredString(values.file)) : kind === 'link' ? createLinkNode(values.x, values.y, requiredString(values.url)) : kind === 'group' ? createGroupNode(values.x, values.y, Number(values.width ?? 400), Number(values.height ?? 300), typeof values.label === 'string' ? values.label : undefined) : null
       if (!created) throw new Error('Unsupported canvas card type.')
       const next = { ...created, ...values, ...(requestedId === undefined ? {} : { id: requiredString(requestedId) }) } as CanvasNode
       if (data.nodes.some((entry) => entry.id === next.id)) throw new Error('The canvas card id already exists.')
@@ -139,7 +139,7 @@ export function applyCanvasOperation(data: CanvasData, raw: unknown): CanvasData
       const { id: requestedId, ...rawValues } = edge
       const values = checkFields(rawValues, canvasEdgeFields)
       needNodes([requiredString(values.fromNode)]); needNodes([requiredString(values.toNode)])
-      const edgeId = requestedId === undefined ? `edge_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}` : requiredString(requestedId)
+      const edgeId = requestedId === undefined ? genId() : requiredString(requestedId)
       if (data.edges.some((entry) => entry.id === edgeId)) throw new Error('The connection id already exists.')
       return addEdge(data, { ...values, id: edgeId } as CanvasEdge)
     }
@@ -157,7 +157,7 @@ export async function readCanvasTarget(api: ValleyPluginApi, path: string, owner
   assertActive()
   if (!path.endsWith('.canvas') || normalizeRelPathOpt(path) !== path) throw new Error('Expected a vault-relative canvas path.')
   const session = canvasSession(path, owner)
-  if (session) { const snapshot = session.get(); if (!snapshot.ready) throw new Error('The canvas is still loading.'); return { data: snapshot.data, revision: snapshot.revision, baseline: null, session } }
+  if (session) { const snapshot = session.get(); if (!snapshot.ready) throw new Error('The canvas is still loading.'); if (snapshot.invalid) throw new Error('The canvas file is invalid.'); return { data: snapshot.data, revision: snapshot.revision, baseline: null, session } }
   if (canvasDraft(path, owner)) throw new Error('The canvas has an unsaved draft. Reopen it and resolve the save error before editing.')
   const recovery = await owner.run(() => { assertActive(); return api.vault.drafts.read(path, 'editor') })
   assertActive()
@@ -166,9 +166,9 @@ export async function readCanvasTarget(api: ValleyPluginApi, path: string, owner
   assertActive()
   if (canvasSession(path, owner) || canvasDraft(path, owner)) throw new Error('The canvas changed. Inspect its active draft before editing.')
   if (!file) throw new Error('The canvas file no longer exists.')
-  const parsed = JSON.parse(file.content)
-  if (!parsed || !Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) throw new Error('The canvas file is invalid.')
-  const data = parseCanvas(file.content)
+  const parsed = parseCanvasDocument(file.content)
+  if (!parsed.valid) throw new Error('The canvas file is invalid.')
+  const data = parsed.data
   return { data, revision: serializeCanvas(data), baseline: file.baseline, session: undefined }
 }
 async function commitTarget(owner: CanvasOwner, path: string, data: CanvasData, previous: Awaited<ReturnType<typeof readCanvasTarget>>, assertActive: () => void): Promise<void> {

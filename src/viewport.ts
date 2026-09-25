@@ -6,13 +6,28 @@ const isMac = typeof navigator !== 'undefined' && navigator.platform.toUpperCase
 
 /**
  * A wheel delta in pixels. A mouse that reports lines or pages would otherwise
- * zoom by a rounding error; these are the multipliers Obsidian applies.
+ * zoom by a rounding error.
  */
 function deltaPixels(e: WheelEvent): number {
   if (e.deltaMode === 1) return e.deltaY * 40 // DOM_DELTA_LINE
   if (e.deltaMode === 2) return e.deltaY * 800 // DOM_DELTA_PAGE
   return e.deltaY
 }
+/** Whether the wheel should scroll content inside the focused card instead of the board. */
+function scrollsInsideFocusedCard(e: WheelEvent): boolean {
+  const target = e.target as Element | null
+  const content = target?.closest?.('.canvas-node.is-focused .canvas-node-content')
+  if (!content) return false
+  for (let node: Element | null = target; node && node !== content.parentElement; node = node.parentElement) {
+    const element = node as HTMLElement
+    const style = element.ownerDocument.defaultView?.getComputedStyle(element)
+    if (!style) continue
+    if (e.deltaY !== 0 && /(auto|scroll)/.test(style.overflowY) && (e.deltaY < 0 ? element.scrollTop > 0 : element.scrollTop + element.clientHeight < element.scrollHeight - 1)) return true
+    if (e.deltaX !== 0 && /(auto|scroll)/.test(style.overflowX) && (e.deltaX < 0 ? element.scrollLeft > 0 : element.scrollLeft + element.clientWidth < element.scrollWidth - 1)) return true
+  }
+  return false
+}
+
 export function useCanvasViewport(rootRef: RefObject<HTMLDivElement>) {
   const [viewport, setViewport] = React.useState<Viewport>({ x: 0, y: 0, zoom: 1 })
   const viewportRef = React.useRef(viewport)
@@ -59,13 +74,14 @@ export function useCanvasViewport(rootRef: RefObject<HTMLDivElement>) {
     const root = rootRef.current
     if (!root) return
     const onWheel = (e: WheelEvent): void => {
+      if (!e.ctrlKey && !e.metaKey && scrollsInsideFocusedCard(e)) return
       e.preventDefault()
       const p = localPoint(e.clientX, e.clientY)
       if (e.ctrlKey || e.metaKey || spaceRef.current) {
-        // Obsidian's curve: the wheel moves the zoom by `-deltaY / 300` octaves,
-        // doubled for the fractional deltas a macOS trackpad sends, so a pinch
-        // covers the same ground as it does there. A per-pixel multiply
-        // (1.0015^-deltaY) travels a different distance at each end of the range.
+        // The wheel moves the zoom by `-deltaY / 300` octaves, doubled for the
+        // fractional deltas a macOS trackpad sends, so a pinch covers the same
+        // ground as a wheel notch. A per-pixel multiply (1.0015^-deltaY) travels
+        // a different distance at each end of the range.
         let octaves = -deltaPixels(e) / 300
         if (isMac && !Number.isInteger(e.deltaY)) octaves *= 2
         setViewport((v) => zoomBy(v, p.x, p.y, octaves))

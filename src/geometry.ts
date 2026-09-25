@@ -30,11 +30,10 @@ export interface Viewport {
 }
 
 /**
- * Zoom is stored as a scale but reasoned about in **log2**, the way Obsidian
- * does it: its viewport keeps `zoom` as a log2 exponent clamped to `[-4, 1]` and
- * derives `scale = 2 ** zoom`. Matching the bounds matters as much as matching
- * the curve — a board that can reach 4× when Obsidian stops at 2× feels wrong
- * long before you notice the number.
+ * Zoom is stored as a scale but reasoned about in **log2**: the zoom exponent is
+ * clamped to `[-4, 1]` and `scale = 2 ** zoom`. Matching the bounds matters as
+ * much as matching the curve — a board that zooms to 4× when other JSON Canvas
+ * editors stop at 2× feels wrong long before you notice the number.
  */
 export const MIN_ZOOM_LOG2 = -4
 export const MAX_ZOOM_LOG2 = 1
@@ -47,9 +46,8 @@ export function clamp(value: number, min: number, max: number): number {
 
 /**
  * World units between background dots, stepped so the **screen** density stays
- * roughly constant instead of collapsing into a haze as you zoom out. These are
- * Obsidian's own thresholds, read off its `gridSpacing` getter, which switches
- * on the log2 zoom:
+ * roughly constant instead of collapsing into a haze as you zoom out. The
+ * thresholds switch on the log2 zoom:
  *
  * ```
  * zoom < -3.3 → 160   zoom < -2.16 → 80   zoom < -0.91 → 40   else → 20
@@ -71,7 +69,7 @@ export function gridSpacing(zoom: number): number {
  * The chrome multiplier for things that must not shrink with the board — resize
  * handles, ports, edge labels. `sqrt(1 / zoom)` rather than `1 / zoom`, so
  * chrome shrinks *some* of the way with the content instead of staying pinned
- * at a fixed screen size. Obsidian publishes exactly this as `--zoom-multiplier`.
+ * at a fixed screen size.
  */
 export function zoomMultiplier(zoom: number): number {
   return Math.sqrt(1 / zoom)
@@ -101,7 +99,7 @@ export function zoomAt(v: Viewport, pivotX: number, pivotY: number, factor: numb
  * Zoom by `steps` **log2 octaves** about a screen pivot — `+1` doubles, `-1`
  * halves, and the same input always travels the same visual distance whether you
  * are at 0.1× or at 2×. That evenness is what a multiply-by-1.2 stepper cannot
- * give you near the ends of the range, and it is how Obsidian's `zoomBy` works.
+ * give you near the ends of the range.
  */
 export function zoomBy(v: Viewport, pivotX: number, pivotY: number, steps: number): Viewport {
   return zoomAt(v, pivotX, pivotY, 2 ** steps)
@@ -201,8 +199,8 @@ function bezierControls(from: Point, fromSide: EdgeSide, to: Point, toSide: Edge
 
 /**
  * The point at t=0.5 on the same curve {@link bezierPath} draws — where an edge
- * label belongs. The straight-line midpoint drifts off a bowed connector, which
- * is why Obsidian anchors its label to the curve instead.
+ * label belongs. The straight-line midpoint drifts off a bowed connector, so the
+ * label is anchored to the curve instead.
  *
  * Closed form for a cubic at t=0.5: `(P0 + 3·P1 + 3·P2 + P3) / 8`.
  */
@@ -230,6 +228,40 @@ export function arrowPoints(tip: Point, side: EdgeSide, size: number): string {
   const a = { x: baseX + px * half, y: baseY + py * half }
   const b = { x: baseX - px * half, y: baseY - py * half }
   return `${tip.x},${tip.y} ${a.x},${a.y} ${b.x},${b.y}`
+}
+
+/** Log2 zoom at or below which the board is "zoomed out": labels hide, cards show placeholders. */
+export const ZOOMED_OUT_LOG2 = -1.7
+/** Length and half-width of the arrowhead, in screen pixels at 100% (scaled by the zoom multiplier). */
+export const ARROW_LENGTH = 10.4
+export const ARROW_HALF_WIDTH = 6.5
+
+/**
+ * A connector as drawn on the board: a straight lead of `lead` world units out
+ * of each card, then a cubic between the two lead ends. The lead keeps an
+ * arrowhead aligned with its side however the curve bends.
+ */
+export function edgePath(from: Point, fromSide: EdgeSide, to: Point, toSide: EdgeSide, lead: number): { path: string; mid: Point; start: Point; end: Point } {
+  const n1 = sideNormal(fromSide)
+  const n2 = sideNormal(toSide)
+  const start = { x: from.x + n1.x * lead, y: from.y + n1.y * lead }
+  const end = { x: to.x + n2.x * lead, y: to.y + n2.y * lead }
+  const [c1, c2] = bezierControls(start, fromSide, end, toSide)
+  return {
+    path: `M ${from.x} ${from.y} L ${start.x} ${start.y} C ${c1.x} ${c1.y} ${c2.x} ${c2.y} ${end.x} ${end.y} L ${to.x} ${to.y}`,
+    mid: bezierMidpoint(start, fromSide, end, toSide),
+    start,
+    end
+  }
+}
+
+/** The arrowhead triangle with its tip on `tip`, opening outward along `side`, scaled by `zm`. */
+export function arrowHead(tip: Point, side: EdgeSide, zm: number): string {
+  const n = sideNormal(side)
+  const baseX = tip.x + n.x * ARROW_LENGTH * zm
+  const baseY = tip.y + n.y * ARROW_LENGTH * zm
+  const half = ARROW_HALF_WIDTH * zm
+  return `${tip.x},${tip.y} ${baseX - n.y * half},${baseY + n.x * half} ${baseX + n.y * half},${baseY - n.x * half}`
 }
 
 /** Bounding rect of every node, or null when there are none. */
@@ -285,7 +317,7 @@ export interface ObjectSnap {
 }
 
 /**
- * Obsidian-style "snap to objects": nudge a dragged rect so one of its
+ * "Snap to objects": nudge a dragged rect so one of its
  * left/center/right (and top/center/bottom) edges aligns with the matching edge
  * of a nearby other rect, within `threshold` world units. Returns the smallest
  * such nudge per axis (0 when nothing is close) and a guide segment spanning the

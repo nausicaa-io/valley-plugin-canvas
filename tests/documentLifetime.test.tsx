@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { METADATA_PANEL_SEGMENT_V1, PLUGIN_SURFACE_V1 } from '@valley/plugin-sdk'
 import type { PluginFileDraftSnapshot } from '@valley/plugin-sdk'
+import { withHostUi } from './support/hostUi'
 import { createMockValleyApi } from '@valley/plugin-testkit'
 import { initRuntime, type CanvasOwner } from '../src/runtime'
 import { canvasDocument, existingCanvasDocument } from '../src/document'
@@ -11,6 +12,9 @@ import { editCanvasTarget, registerCanvasCommands } from '../src/commands'
 import { registerCanvasSurfaces } from '../src/surfaces'
 import { serializeCanvas, parseCanvas, type CanvasData } from '../src/canvasModel'
 import CanvasEditor from '../src/CanvasEditor'
+
+/** A workspace tab: the file view renders the editor, not the embedded minimap. */
+const TAB = { id: 'tab-1', kind: 'file', path: 'Test.canvas' }
 import { NodeView, type NodeViewProps } from '../src/CanvasNode'
 
 const original: CanvasData = { nodes: [{ id: 'a', type: 'text', text: 'Original', x: 0, y: 0, width: 200, height: 100 }], edges: [] }
@@ -18,7 +22,7 @@ const scene = (text: string): CanvasData => ({ ...original, nodes: [{ ...origina
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((done) => { resolve = done }); return { promise, resolve } }
 const owners: CanvasOwner[] = []
 function setup() {
-  const mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(original), 'Other.canvas': serializeCanvas(scene('Other')) } })
+  const mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(original), 'Other.canvas': serializeCanvas(scene('Other')) } }))
   vi.spyOn(mock.api.vault, 'readFileBaseline')
   const owner = initRuntime(mock.api); owners.push(owner)
   return { mock, owner }
@@ -36,7 +40,7 @@ describe('durable Canvas recovery', () => {
   it('holds fresh API hydration until the predecessor journal physically settles', async () => {
     const fileDrafts = new Map<string, PluginFileDraftSnapshot>()
     const options = { manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(original) }, fileDrafts }
-    const first = createMockValleyApi(options)
+    const first = withHostUi(createMockValleyApi(options))
     const owner = initRuntime(first.api); owners.push(owner)
     const { document, detach } = await ready(owner)
     const held = deferred<void>()
@@ -44,7 +48,7 @@ describe('durable Canvas recovery', () => {
     const journal = vi.spyOn(first.api.vault.drafts, 'write').mockImplementationOnce(async (...args) => { await held.promise; return write(...args) })
     document.setData(scene('Held recovery')); document.schedule(document.get().data)
     await vi.waitFor(() => expect(journal).toHaveBeenCalledOnce())
-    const fresh = createMockValleyApi(options)
+    const fresh = withHostUi(createMockValleyApi(options))
     const read = vi.spyOn(fresh.api.vault.drafts, 'read')
     const replacement = initRuntime(fresh.api); owners.push(replacement)
     const recovered = canvasDocument(replacement, 'Test.canvas')
@@ -61,14 +65,14 @@ describe('durable Canvas recovery', () => {
   it('recovers a fresh runtime with its original baseline and clears after saving exact content', async () => {
     const fileDrafts = new Map<string, PluginFileDraftSnapshot>()
     const options = { manifest: { id: 'canvas' }, files: { 'Test.canvas': serializeCanvas(original) }, fileDrafts }
-    const first = createMockValleyApi(options)
+    const first = withHostUi(createMockValleyApi(options))
     const owner = initRuntime(first.api); owners.push(owner)
     const { document, detach } = await ready(owner)
     document.setData(scene('Recovered ä ö ü')); document.schedule(document.get().data)
     detach(); await owner.dispose()
     expect(fileDrafts.size).toBe(1)
     expect(first.api.vault.writeFileGuarded).not.toHaveBeenCalled()
-    const fresh = createMockValleyApi(options)
+    const fresh = withHostUi(createMockValleyApi(options))
     const replacement = initRuntime(fresh.api); owners.push(replacement)
     const { document: recovered, detach: close } = await ready(replacement)
     expect(recovered.get().data.nodes[0]).toMatchObject({ text: 'Recovered ä ö ü' })
@@ -155,13 +159,13 @@ describe('durable Canvas recovery', () => {
 describe('captured Canvas document authority', () => {
   it('shares the draft and one guarded save across simultaneous panes, retaining the remaining bridge', async () => {
     const { mock } = setup()
-    const first = render(<CanvasEditor relPath="Test.canvas" />)
-    const second = render(<CanvasEditor relPath="Test.canvas" />)
+    const first = render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
+    const second = render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
     await waitFor(() => expect(screen.getAllByText('Original')).toHaveLength(2))
     expect(mock.api.vault.readFileBaseline).toHaveBeenCalledTimes(1)
     fireEvent.doubleClick(within(first.container).getByText('Original'))
     const input = within(first.container).getByDisplayValue('Original')
-    fireEvent.change(input, { target: { value: 'Shared draft' } }); fireEvent.blur(input)
+    fireEvent.change(input, { target: { value: 'Shared draft' } }); fireEvent.keyDown(input, { key: 'Escape' })
     await waitFor(() => expect(screen.getAllByText('Shared draft')).toHaveLength(2))
     second.unmount()
     expect(canvasSession('Test.canvas')?.get().data.nodes[0]).toMatchObject({ text: 'Shared draft' })
@@ -174,7 +178,7 @@ describe('captured Canvas document authority', () => {
 
   it('does not register an unapplied UI undo while a command has synchronously reserved the document', async () => {
     const { mock, owner } = setup()
-    render(<CanvasEditor relPath="Test.canvas" />)
+    render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
     await screen.findByText('Original')
     vi.spyOn(mock.api.ui, 'openMenu')
     fireEvent.contextMenu(document.querySelector('.canvas-root')!)
@@ -410,14 +414,14 @@ describe('command, Properties and undo lifetimes', () => {
 
   it('routes UI undo to a reopened pane and refuses to overwrite intervening external work', async () => {
     const { mock } = setup()
-    const first = render(<CanvasEditor relPath="Test.canvas" />)
+    const first = render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
     fireEvent.doubleClick(await screen.findByText('Original'))
     const input = screen.getByDisplayValue('Original')
-    fireEvent.change(input, { target: { value: 'Edited' } }); fireEvent.blur(input)
+    fireEvent.change(input, { target: { value: 'Edited' } }); fireEvent.keyDown(input, { key: 'Escape' })
     await act(async () => { await mock.runBeforeUnload() })
     const undo = mock.undoActions.at(-1)!
     first.unmount()
-    const next = render(<CanvasEditor relPath="Test.canvas" />)
+    const next = render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
     await screen.findByText('Edited')
     await act(async () => { await undo.undo() })
     expect(await screen.findByText('Original')).toBeTruthy()
@@ -442,7 +446,7 @@ describe('command, Properties and undo lifetimes', () => {
     expect(screen.queryByText('Original')).toBeNull()
     const input = screen.getByLabelText('X position')
     fireEvent.change(input, { target: { value: '22' } })
-    off(); fireEvent.blur(input)
+    off(); fireEvent.keyDown(input, { key: 'Escape' })
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('no longer registered'))
     expect(mock.api.vault.writeFileGuarded).not.toHaveBeenCalled()
     properties.unmount()
@@ -451,7 +455,7 @@ describe('command, Properties and undo lifetimes', () => {
 
 describe('Canvas preview ownership', () => {
   function preview() {
-    const mock = createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Fern.md': 'Fern preview' } })
+    const mock = withHostUi(createMockValleyApi({ manifest: { id: 'canvas' }, files: { 'Fern.md': 'Fern preview' } }))
     const owner = initRuntime(mock.api); owners.push(owner)
     let intersect!: (value: boolean) => void
     vi.stubGlobal('IntersectionObserver', class {
@@ -462,7 +466,7 @@ describe('Canvas preview ownership', () => {
     const props: NodeViewProps = {
       owner, previewEnabled: true,
       node: { id: 'fern', type: 'file', file: 'Fern.md', x: 0, y: 0, width: 200, height: 100 },
-      index: 0, selected: false, singleSelected: false, editing: false, dragging: false, readOnly: false,
+      index: 0, selected: false, focused: false, editing: false, dragging: false, zoom: 1, readOnly: false,
       onNodePointerDown: vi.fn(), onResizeStart: vi.fn(), onConnectStart: vi.fn(), onStartEdit: vi.fn(), onCommit: vi.fn(), onCancelEdit: vi.fn()
     }
     return { mock, owner, props, intersect: (value: boolean) => intersect(value) }
@@ -533,7 +537,7 @@ it('fits a previously hidden editor on resize and preserves subsequent user pan 
   const { owner } = setup()
   let resize!: () => void
   vi.stubGlobal('ResizeObserver', class { constructor(callback: () => void) { resize = callback } observe() {} disconnect() {} })
-  const mounted = render(<CanvasEditor relPath="Test.canvas" />)
+  const mounted = render(<CanvasEditor relPath="Test.canvas" tab={TAB} />)
   try {
     await waitFor(() => expect(canvasSession('Test.canvas', owner)?.get().ready).toBe(true))
     expect(canvasSession('Test.canvas', owner)?.get().viewport).toEqual({ x: 0, y: 0, zoom: 1 })

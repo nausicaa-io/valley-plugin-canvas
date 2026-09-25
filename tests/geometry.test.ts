@@ -70,7 +70,7 @@ describe('viewport transforms', () => {
     expect(zoomed.zoom).toBeCloseTo(0.75)
   })
 
-  // Obsidian clamps its log2 zoom to [-4, 1]; these are those bounds as scales.
+  // The log2 zoom is clamped to [-4, 1]; these are those bounds as scales.
   it('zoomAt clamps to the zoom bounds', () => {
     expect(zoomAt({ x: 0, y: 0, zoom: 1 }, 0, 0, 100).zoom).toBe(MAX_ZOOM)
     expect(MAX_ZOOM).toBe(2)
@@ -88,7 +88,7 @@ describe('viewport transforms', () => {
     expect(at.x).toBeCloseTo(screenToWorld({ x: 100, y: 50, zoom: 1 }, 300, 200).x)
   })
 
-  // The thresholds are Obsidian's, expressed in scale: 2^-3.3, 2^-2.16, 2^-0.91.
+  // The thresholds, expressed in scale: 2^-3.3, 2^-2.16, 2^-0.91.
   it('gridSpacing steps with the zoom so screen density stays even', () => {
     expect(gridSpacing(1)).toBe(20)
     expect(gridSpacing(2)).toBe(20)
